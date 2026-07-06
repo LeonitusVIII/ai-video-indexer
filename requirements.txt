@@ -1,0 +1,23 @@
+# Core app (installed automatically by setup.bat)
+streamlit
+pandas
+psutil
+requests
+
+# Transcription
+faster-whisper
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# PyTorch CUDA — install separately:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Video / search / vision
+opencv-python
+pillow
+ffmpeg-python
+qdrant-client
+sentence-transformers
+transformers
+accelerate
+qwen-vl-utils
