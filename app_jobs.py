@@ -3,7 +3,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from app_helpers import compute_job_eta
+from app_helpers import compute_job_elapsed
 
 PIPELINE_STEP_KEYS = (
     "scan",
@@ -135,7 +135,7 @@ def render_job_progress_layers(job, job_file, read_job_fn, *, compact=False):
 
     active = step_status or job
     step_total = int(active.get("total", 0) or 0)
-    if is_pipeline and step_total >= 0:
+    if is_pipeline and step_total > 0:
         step_percent = int(active.get("percent", 0))
         step_label = job.get("pipeline_step") or "Current step"
         step_unit = _item_unit(job)
@@ -176,7 +176,7 @@ def render_job_status_banner(job_files, read_job_fn, stop_job_fn, *, key_prefix=
     folder = job.get("folder") or ""
     if len(folder) > 72:
         folder = folder[:69] + "…"
-    eta = compute_job_eta(job) or "—"
+    elapsed = compute_job_elapsed(job) or "—"
     processed = job.get("processed", 0)
     total = job.get("total", 0)
     current = job.get("current") or ""
@@ -196,7 +196,7 @@ def render_job_status_banner(job_files, read_job_fn, stop_job_fn, *, key_prefix=
         with banner_col3:
             unit = "steps" if is_pipeline_job(job) else "files"
             st.caption(
-                f"**{percent}%** complete · {processed} / {total} {unit} · ETA **{eta}**"
+                f"**{percent}%** complete · {processed} / {total} {unit} · Elapsed **{elapsed}**"
             )
         with banner_col4:
             if st.button("Stop", key=f"{key_prefix}banner_stop", use_container_width=True):
@@ -263,7 +263,7 @@ def render_job_panel(
             unit_label,
             f"{job.get('processed', 0)} / {job.get('total', 0)}",
         )
-        col4.metric("ETA", compute_job_eta(job) or "—")
+        col4.metric("Elapsed", compute_job_elapsed(job) or "—")
 
         if job.get("pid") and job.get("status") == "running":
             st.caption(f"PID {job.get('pid')}")

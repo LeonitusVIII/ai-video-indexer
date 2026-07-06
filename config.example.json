@@ -3,13 +3,13 @@
   "selected_folder": "",
   "processing": {
     "transcription_model": "large-v3",
+    "vision_model": "qwen2.5-vl-3b",
     "use_gpu": true,
     "vision_frame_interval_seconds": 30,
     "min_frames_per_video": 3,
     "overwrite_existing": false,
-    "normalize_dry_run": true,
     "skip_mode": "missing_only",
-    "scan_before_pipeline": true,
+    "scan_after_pipeline": true,
     "step_overwrite": {
       "normalize": false,
       "transcribe": false,

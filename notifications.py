@@ -1,5 +1,6 @@
 import datetime
 import json
+from pathlib import Path
 from urllib import request
 from urllib.error import URLError
 
@@ -43,18 +44,20 @@ def send_discord_webhook(webhook_url, title, message, color=5763719, fields=None
 def notify_pipeline_event(webhook_url, event, folder_label, details, log_file=""):
     colors = {
         "complete": 5763719,
+        "complete_with_failures": 16766720,
         "failed": 15548997,
         "stopped": 16776960,
     }
     titles = {
         "complete": "Video Indexer pipeline complete",
+        "complete_with_failures": "Video Indexer pipeline finished with failures",
         "failed": "Video Indexer pipeline failed",
         "stopped": "Video Indexer pipeline stopped",
     }
 
     fields = [{"name": "Folder(s)", "value": folder_label[:1024], "inline": False}]
     if log_file:
-        fields.append({"name": "Log", "value": log_file[:1024], "inline": False})
+        fields.append({"name": "Log file", "value": Path(log_file).name[:1024], "inline": False})
 
     return send_discord_webhook(
         webhook_url,

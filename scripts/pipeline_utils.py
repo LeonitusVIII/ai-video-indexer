@@ -158,10 +158,28 @@ def normalize_needed(video_path):
     return not path.with_suffix(".mkv").exists()
 
 
+def vision_output_complete(sidecar_path):
+    path = Path(sidecar_path)
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return data.get("status", "complete") == "complete"
+
+
 def step_is_complete(video_row, step_key):
     path = video_row.get("path", "")
     if step_key == "normalize":
         return not normalize_needed(path)
+
+    if step_key == "vision":
+        sidecar = _step_sidecar(path, step_key)
+        if not vision_output_complete(sidecar):
+            return False
+        flag_col = STEP_DB_FLAG.get(step_key)
+        return bool(flag_col and video_row.get(flag_col))
 
     flag_col = STEP_DB_FLAG.get(step_key)
     sidecar = _step_sidecar(path, step_key)

@@ -25,10 +25,9 @@ from app_db import (
     prune_missing_videos,
     remove_folder_from_library,
 )
-from app_help import render_help_tab
+from app_help import render_help_tab, whisper_model_info_popover, vision_model_info_popover
 from app_helpers import (
     videos_status_dataframe,
-    compute_job_eta,
     open_video_at_timestamp,
     browse_for_folder,
     search_result_preview_text,
@@ -38,14 +37,17 @@ from app_helpers import (
     inject_search_results_styles,
     search_result_meta_line,
     format_modified_time,
+    find_vision_resume_mismatches,
 )
 from app_jobs import render_job_panel, render_job_status_banner, tail_log_file
 from app_wizard import render_setup_wizard, environment_ready
 from notifications import send_discord_webhook
+from pipeline_estimate import render_pipeline_estimator_ui
 
 SCRIPT_DIR_IMPORT = Path(__file__).parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR_IMPORT))
 from pipeline_utils import filter_videos_by_status, video_has_incomplete_steps, STEP_LABELS
+from job_utils import DEFAULT_VISION_MODEL_KEY, VISION_MODEL_OPTIONS
 
 APP_DIR = Path(__file__).parent
 CONFIG_FILE = APP_DIR / "config.json"
@@ -71,6 +73,7 @@ WHISPER_MODELS = (
     "large-v2",
     "large-v3",
 )
+VISION_MODEL_KEYS = tuple(VISION_MODEL_OPTIONS.keys())
 SEARCH_EXAMPLE_QUERIES = (
     "birthday party",
     "kids swimming",
@@ -86,13 +89,13 @@ DEFAULT_CONFIG = {
     "selected_folder": "",
     "processing": {
         "transcription_model": "large-v3",
+        "vision_model": DEFAULT_VISION_MODEL_KEY,
         "use_gpu": True,
         "vision_frame_interval_seconds": 30,
         "min_frames_per_video": 3,
         "overwrite_existing": False,
-        "normalize_dry_run": True,
         "skip_mode": "missing_only",
-        "scan_before_pipeline": True,
+        "scan_after_pipeline": True,
         "step_overwrite": {
             "normalize": False,
             "transcribe": False,
@@ -127,9 +130,12 @@ def load_config():
         config["pipeline"].pop("enhance_audio", None)
 
     processing = config.setdefault("processing", {})
+    processing.pop("scan_before_pipeline", None)
+    processing.pop("normalize_dry_run", None)
+    processing.setdefault("scan_after_pipeline", True)
     processing.setdefault("skip_mode", "missing_only")
-    processing.setdefault("scan_before_pipeline", True)
     processing.setdefault("transcription_model", "large-v3")
+    processing.setdefault("vision_model", DEFAULT_VISION_MODEL_KEY)
     processing.setdefault("step_overwrite", DEFAULT_CONFIG["processing"]["step_overwrite"].copy())
 
     return config
@@ -139,7 +145,51 @@ def save_config(config):
     CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
+def is_pid_running(pid):
+    if not pid:
+        return False
+    try:
+        proc = psutil.Process(int(pid))
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.Error, ValueError, TypeError):
+        return False
+
+
+def sync_resume_to_failed(job):
+    """Keep resume coordinates after a crash but mark the run as resumable."""
+    if not RESUME_FILE.exists() or not job:
+        return
+    try:
+        saved = json.loads(RESUME_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if saved.get("job_id") != job.get("job_id"):
+        return
+    if saved.get("status") == "running":
+        saved["status"] = "failed"
+        RESUME_FILE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+
+
+def cleanup_stale_running_jobs():
+    """Mark orphaned job files as failed when their process is no longer running."""
+    changed = False
+    for job_file in JOBS_DIR.glob("*.json"):
+        job = read_job(job_file)
+        if not job or job.get("status") != "running":
+            continue
+        if is_pid_running(job.get("pid")):
+            continue
+        job["status"] = "failed"
+        job["current"] = "Job interrupted (process no longer running)."
+        job["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        job_file.write_text(json.dumps(job, indent=2), encoding="utf-8")
+        sync_resume_to_failed(job)
+        changed = True
+    return changed
+
+
 def running_job_summary():
+    cleanup_stale_running_jobs()
     jobs = active_job_files()
     if not jobs:
         return None
@@ -205,12 +255,19 @@ def cleanup_stale_resume_state():
         return
 
     status = saved.get("status")
-    if status in {"complete", "running"}:
-        job_id = saved.get("job_id", "")
-        job_file = JOBS_DIR / f"{job_id}.json"
-        job = read_job(job_file) if job_file.exists() else None
-        if status == "complete" or not job or job.get("status") != "running":
-            RESUME_FILE.unlink(missing_ok=True)
+    if status == "complete":
+        RESUME_FILE.unlink(missing_ok=True)
+        return
+
+    job_id = saved.get("job_id", "")
+    job_file = JOBS_DIR / f"{job_id}.json"
+    job = read_job(job_file) if job_file.exists() else None
+
+    if status == "running":
+        if job and job.get("status") == "running":
+            return
+        saved["status"] = "failed"
+        RESUME_FILE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
 
 
 def can_resume_pipeline():
@@ -241,18 +298,10 @@ def safe_folder_name(folder):
     return "".join(keep).strip().replace(" ", "_")[:60]
 
 
-def normalize_args(config):
-    p = config.get("processing", {})
-    return [
-        "--dry-run", "true" if p.get("normalize_dry_run", True) else "false",
-        "--overwrite", "true" if p.get("overwrite_existing", False) else "false",
-    ]
-
-
 def pipeline_args(config, folders, resume=False, video_filter_file=None):
     steps = config.get("pipeline", {})
     processing = config.get("processing", {})
-    args = processing_args(config) + normalize_args(config)
+    args = processing_args(config)
     step_flags = [
         ("normalize", "normalize"),
         ("transcribe", "transcribe"),
@@ -268,8 +317,8 @@ def pipeline_args(config, folders, resume=False, video_filter_file=None):
     args.extend(["--folders-file", str(PIPELINE_FOLDERS_FILE)])
     args.extend(["--resume", "true" if resume else "false"])
     args.extend(["--skip-mode", processing.get("skip_mode", "missing_only")])
-    scan_first = processing.get("scan_before_pipeline", True)
-    args.extend(["--scan-first", "true" if scan_first else "false"])
+    scan_after = processing.get("scan_after_pipeline", True)
+    args.extend(["--scan-after", "true" if scan_after else "false"])
 
     step_overwrite = processing.get("step_overwrite", {})
     if step_overwrite:
@@ -277,10 +326,6 @@ def pipeline_args(config, folders, resume=False, video_filter_file=None):
 
     if video_filter_file:
         args.extend(["--videos-file", str(video_filter_file)])
-
-    webhook = config.get("notifications", {}).get("discord_webhook_url", "").strip()
-    if webhook:
-        args.extend(["--discord-webhook", webhook])
 
     return args
 
@@ -327,12 +372,16 @@ def processing_args(config):
     model = p.get("transcription_model", "large-v3")
     if model not in WHISPER_MODELS:
         model = "large-v3"
+    vision_model = p.get("vision_model", DEFAULT_VISION_MODEL_KEY)
+    if vision_model not in VISION_MODEL_OPTIONS:
+        vision_model = DEFAULT_VISION_MODEL_KEY
     return [
         "--use-gpu", "true" if p.get("use_gpu", True) else "false",
         "--overwrite", "true" if p.get("overwrite_existing", False) else "false",
         "--vision-interval", str(int(p.get("vision_frame_interval_seconds", 30))),
         "--min-frames", str(int(p.get("min_frames_per_video", 3))),
         "--transcription-model", model,
+        "--vision-model", vision_model,
     ]
 
 
@@ -395,12 +444,6 @@ def run_script(script_name, folder, extra_args=None, folder_label=None):
         "stop_requested": False,
     }
 
-    if script_name == "run_pipeline.py":
-        status["notifications"] = load_config().get(
-            "notifications",
-            DEFAULT_CONFIG["notifications"],
-        )
-
     status_file.write_text(json.dumps(status, indent=2), encoding="utf-8")
     st.success(f"Started: {script_name}")
     return True
@@ -429,7 +472,7 @@ def stop_job(job_file):
                 st.error(f"Could not stop process: {e}")
 
 
-@st.fragment(run_every=datetime.timedelta(seconds=2))
+@st.fragment(run_every=datetime.timedelta(seconds=1))
 def render_dashboard_live():
     job_files = active_job_files()
     render_job_panel(
@@ -472,12 +515,13 @@ def render_dashboard_live():
             if len(gpu_parts) >= 5:
                 gpu_name, gpu_util, gpu_mem_used, gpu_mem_total, gpu_temp = gpu_parts[:5]
 
-                col1, col2, col3, col4 = st.columns(4)
-
-                col1.metric("GPU", gpu_name)
-                col2.metric("GPU Usage", f"{gpu_util}%")
-                col3.metric("GPU Memory", f"{gpu_mem_used} / {gpu_mem_total} MB")
-                col4.metric("GPU Temp", f"{gpu_temp}°C")
+                gpu_left, gpu_right = st.columns(2)
+                with gpu_left:
+                    st.markdown(f"**GPU:** {gpu_name}")
+                    st.markdown(f"**GPU usage:** {gpu_util}%")
+                with gpu_right:
+                    st.markdown(f"**GPU memory:** {gpu_mem_used} / {gpu_mem_total} MB")
+                    st.markdown(f"**GPU temp:** {gpu_temp}°C")
         else:
             st.info("No NVIDIA GPU status available.")
     except Exception as e:
@@ -497,7 +541,7 @@ def render_dashboard_live():
     col4.metric("Indexed", stats["indexed"])
 
 
-@st.fragment(run_every=datetime.timedelta(seconds=2))
+@st.fragment(run_every=datetime.timedelta(seconds=1))
 def render_logs_live():
     logs = sorted(LOG_DIR.glob("*.log"), reverse=True)
 
@@ -512,7 +556,7 @@ def render_logs_live():
         key="logs_tab_select",
     )
 
-    st.caption("Live — refreshes every 2 seconds.")
+    st.caption("Live — refreshes every second.")
 
     if selected_log.exists():
         try:
@@ -537,7 +581,7 @@ def _render_job_banner(key_prefix):
 
 
 def make_job_banner_fragment(key_prefix):
-    @st.fragment(run_every=datetime.timedelta(seconds=2))
+    @st.fragment(run_every=datetime.timedelta(seconds=1))
     def banner():
         _render_job_banner(key_prefix)
     return banner
@@ -560,7 +604,7 @@ st.set_page_config(page_title="AI Video Indexer", layout="wide")
 st.title("AI Video Indexer")
 
 tab_dashboard, tab_library, tab_jobs, tab_search, tab_tools, tab_logs, tab_help = st.tabs(
-    ["Dashboard", "Library", "Run Jobs", "Search", "Tools / Status", "Logs", "Help"]
+    ["Dashboard", "Library", "Run Jobs", "Search", "Tools/System", "Logs", "Help"]
 )
 
 with tab_dashboard:
@@ -719,7 +763,7 @@ with tab_jobs:
     if not env_ready:
         st.warning(
             "Processing jobs are disabled until setup completes. "
-            "Run **setup.bat**, then use **Tools / Status → Refresh System Check** to verify FFmpeg and the virtual environment."
+            "Run **setup.bat**, then use **Tools/System → Refresh System Check** to verify FFmpeg and the virtual environment."
         )
 
     if not config["folders"]:
@@ -736,82 +780,105 @@ with tab_jobs:
 
         st.subheader("Processing Settings")
 
-        config["processing"]["use_gpu"] = st.checkbox(
-            "Use GPU where possible",
-            value=config["processing"].get("use_gpu", True),
-            help="Uses your GPU for supported jobs such as Whisper transcription and local AI vision where available."
-        )
+        with st.container(border=True):
+            st.markdown("**General**")
+            gen_col1, gen_col2 = st.columns(2)
+            with gen_col1:
+                config["processing"]["use_gpu"] = st.checkbox(
+                    "Use GPU where possible",
+                    value=config["processing"].get("use_gpu", True),
+                    help="Uses your GPU for Whisper transcription and local vision models when available.",
+                )
+            with gen_col2:
+                config["processing"]["overwrite_existing"] = st.checkbox(
+                    "Overwrite existing output files",
+                    value=config["processing"].get("overwrite_existing", False),
+                    help="When off, jobs skip videos that already have matching outputs. Safer for resuming long runs.",
+                )
 
-        config["processing"]["overwrite_existing"] = st.checkbox(
-            "Overwrite existing output files",
-            value=config["processing"].get("overwrite_existing", False),
-            help="When off, jobs should skip videos that already have matching outputs. This helps resume long runs safely."
-        )
+            st.caption("Skip mode controls which videos each pipeline step processes.")
+            config["processing"]["scan_after_pipeline"] = st.checkbox(
+                "Rescan library after pipeline completes",
+                value=config["processing"].get("scan_after_pipeline", True),
+                help="Updates catalog flags and Library tab counts when the pipeline finishes. Turn off to save time on very large libraries.",
+            )
+            config["processing"]["skip_mode"] = st.selectbox(
+                "Pipeline skip mode",
+                list(SKIP_MODE_OPTIONS.keys()),
+                format_func=lambda key: SKIP_MODE_OPTIONS[key],
+                index=list(SKIP_MODE_OPTIONS.keys()).index(
+                    config["processing"].get("skip_mode", "missing_only")
+                ) if config["processing"].get("skip_mode", "missing_only") in SKIP_MODE_OPTIONS else 1,
+                help="Missing-only is safest for re-runs. Use stale-only to refresh metadata/index after transcript or vision changes.",
+            )
 
-        config["processing"]["vision_frame_interval_seconds"] = st.number_input(
-            "Vision frame interval, seconds",
-            min_value=1,
-            max_value=300,
-            value=int(config["processing"].get("vision_frame_interval_seconds", 30)),
-            help="How often to extract frames for visual analysis. For example, 30 means one frame every 30 seconds."
-        )
+        settings_col1, settings_col2 = st.columns(2)
 
-        config["processing"]["min_frames_per_video"] = st.number_input(
-            "Minimum frames per short video",
-            min_value=1,
-            max_value=20,
-            value=int(config["processing"].get("min_frames_per_video", 3)),
-            help="A short video means any video too short to naturally produce this many frames using the interval above. Example: a 10-second clip with a 30-second interval would still get 3 sampled frames."
-        )
+        with settings_col1:
+            with st.container(border=True):
+                whisper_head_col, whisper_info_col = st.columns([4, 1])
+                with whisper_head_col:
+                    st.markdown("**Transcription (Whisper)**")
+                with whisper_info_col:
+                    whisper_model_info_popover()
+                current_model = config["processing"].get("transcription_model", "large-v3")
+                if current_model not in WHISPER_MODELS:
+                    current_model = "large-v3"
+                config["processing"]["transcription_model"] = st.selectbox(
+                    "Whisper model",
+                    WHISPER_MODELS,
+                    index=WHISPER_MODELS.index(current_model),
+                    help="Larger models are more accurate but slower and use more VRAM. large-v3 is recommended on a GPU.",
+                )
 
-        current_model = config["processing"].get("transcription_model", "large-v3")
-        if current_model not in WHISPER_MODELS:
-            current_model = "large-v3"
-        config["processing"]["transcription_model"] = st.selectbox(
-            "Whisper transcription model",
-            WHISPER_MODELS,
-            index=WHISPER_MODELS.index(current_model),
-            help="Larger models are more accurate but slower and use more VRAM. large-v3 is recommended on a GPU.",
-        )
+        with settings_col2:
+            with st.container(border=True):
+                vision_head_col, vision_info_col = st.columns([4, 1])
+                with vision_head_col:
+                    st.markdown("**Vision analysis**")
+                with vision_info_col:
+                    vision_model_info_popover()
+                current_vision_model = config["processing"].get(
+                    "vision_model", DEFAULT_VISION_MODEL_KEY
+                )
+                if current_vision_model not in VISION_MODEL_OPTIONS:
+                    current_vision_model = DEFAULT_VISION_MODEL_KEY
+                config["processing"]["vision_model"] = st.selectbox(
+                    "Vision model",
+                    VISION_MODEL_KEYS,
+                    index=VISION_MODEL_KEYS.index(current_vision_model),
+                    format_func=lambda key: VISION_MODEL_OPTIONS[key]["label"],
+                    help="Local model used for frame descriptions. Larger models need more VRAM and run slower.",
+                )
 
-        config["processing"]["normalize_dry_run"] = st.checkbox(
-            "Normalize dry run only (preview container conversion, no file changes)",
-            value=config["processing"].get("normalize_dry_run", True),
-            help="When normalize is included in the pipeline, leave this on for a safe preview first."
-        )
+                vision_col1, vision_col2 = st.columns(2)
+                with vision_col1:
+                    config["processing"]["vision_frame_interval_seconds"] = st.number_input(
+                        "Frame interval (sec)",
+                        min_value=1,
+                        max_value=300,
+                        value=int(config["processing"].get("vision_frame_interval_seconds", 30)),
+                        help="Extract one frame every N seconds. Lower values greatly increase processing time.",
+                    )
+                with vision_col2:
+                    config["processing"]["min_frames_per_video"] = st.number_input(
+                        "Min frames (short clips)",
+                        min_value=1,
+                        max_value=20,
+                        value=int(config["processing"].get("min_frames_per_video", 3)),
+                        help="Short videos still get at least this many sampled frames.",
+                    )
 
-        st.markdown("**Skip mode** controls which videos each step processes.")
-        config["processing"]["skip_mode"] = st.selectbox(
-            "Pipeline skip mode",
-            list(SKIP_MODE_OPTIONS.keys()),
-            format_func=lambda key: SKIP_MODE_OPTIONS[key],
-            index=list(SKIP_MODE_OPTIONS.keys()).index(
-                config["processing"].get("skip_mode", "missing_only")
-            ) if config["processing"].get("skip_mode", "missing_only") in SKIP_MODE_OPTIONS else 1,
-            help="Missing-only is safest for re-runs. Use stale-only to refresh metadata/index after transcript or vision changes.",
-        )
+        save_config(config)
 
-        st.caption(
-            f"Vision: **{config['processing']['vision_frame_interval_seconds']}s** interval, "
-            f"**{config['processing']['min_frames_per_video']}** min frames | "
-            f"Whisper **{config['processing']['transcription_model']}** | "
-            f"GPU **{'on' if config['processing']['use_gpu'] else 'off'}** | "
-            f"Overwrite **{'on' if config['processing']['overwrite_existing'] else 'off'}** | "
-            f"Normalize dry run **{'on' if config['processing']['normalize_dry_run'] else 'off'}**"
-        )
+        render_pipeline_estimator_ui(config, DATA_DIR / "system_check.json")
 
         st.divider()
 
         st.subheader("Step 1 — Scan library")
-        config["processing"]["scan_before_pipeline"] = st.checkbox(
-            "Scan library before pipeline (included in pipeline progress)",
-            value=config["processing"].get("scan_before_pipeline", True),
-            help="When you run the pipeline below, scan this folder first and count it in the overall progress bar.",
-        )
-        save_config(config)
         st.write(
-            "Scan once after adding a folder or when new videos appear. "
-            "Use the button below for a scan-only job, or enable the checkbox above when running the pipeline."
+            "Scan after adding a folder or when new videos appear on disk. "
+            "This updates the catalog and library summary counts."
         )
 
         if st.button("Scan Library", key="scan_library_btn", disabled=not env_ready):
@@ -827,7 +894,7 @@ with tab_jobs:
         pipeline_steps = [
             ("normalize", "Normalize old videos", "Remux MOV/VOB/AVI/etc. to MKV"),
             ("transcribe", "Transcribe", "Whisper speech-to-text"),
-            ("vision", "Analyze vision", "Qwen2.5-VL frame descriptions"),
+            ("vision", "Analyze vision", "Local vision model frame descriptions"),
             ("metadata", "Build metadata", "Merge transcript + vision for search"),
             ("index", "Index search DB", "Embed segments into Qdrant"),
         ]
@@ -865,6 +932,78 @@ with tab_jobs:
         ) or "none selected"
 
         st.caption(f"**{selected_count}** step(s) selected: {step_summary}")
+
+        pipeline_scope = st.radio(
+            "Pipeline scope",
+            ["Selected folder only", "All library folders"],
+            horizontal=True,
+            help="Run the selected steps on one folder or every folder in your library.",
+        )
+
+        resume_available = can_resume_pipeline()
+        resume_pipeline = False
+        if resume_available:
+            resume_pipeline = st.checkbox(
+                "Resume from last failed/stopped pipeline",
+                value=False,
+                key="resume_pipeline_checkbox",
+                help="Continues from the step where the previous pipeline stopped or failed.",
+            )
+            st.info("A previous pipeline can be resumed from where it stopped.")
+            try:
+                resume_state = json.loads(RESUME_FILE.read_text(encoding="utf-8"))
+                resume_folders = resume_state.get("folders") or []
+            except Exception:
+                resume_folders = []
+            vision_mismatches = find_vision_resume_mismatches(config, resume_folders)
+            if vision_mismatches:
+                st.warning(
+                    "Partial vision output exists for "
+                    f"**{len(vision_mismatches)}** video(s) but your vision model or frame "
+                    "settings changed since that run. Those videos will restart vision "
+                    "from the beginning (not resume mid-file)."
+                )
+                with st.expander("Affected videos"):
+                    for path in vision_mismatches[:20]:
+                        st.code(path)
+                    if len(vision_mismatches) > 20:
+                        st.caption(f"...and {len(vision_mismatches) - 20} more.")
+        elif "resume_pipeline_checkbox" in st.session_state:
+            st.session_state["resume_pipeline_checkbox"] = False
+
+        run_pipeline = st.button(
+            "Run Selected Pipeline",
+            type="primary",
+            disabled=selected_count == 0 or not env_ready,
+        )
+
+        if run_pipeline:
+            if selected_count == 0:
+                st.warning("Select at least one pipeline step.")
+            else:
+                webhook = config.get("notifications", {}).get("discord_webhook_url", "").strip()
+                if not webhook:
+                    st.caption("Tip: add a Discord webhook under **Tools/System** for pipeline completion alerts.")
+                if pipeline_scope == "All library folders":
+                    target_folders = list(config["folders"])
+                    folder_label = "All_Folders"
+                    anchor_folder = target_folders[0]
+                else:
+                    target_folders = [selected_folder]
+                    folder_label = None
+                    anchor_folder = selected_folder
+
+                if resume_pipeline and not resume_available:
+                    st.warning("Nothing to resume.")
+                else:
+                    clear_pipeline_video_filter()
+                    run_pipeline_job(
+                        config,
+                        target_folders,
+                        anchor_folder,
+                        folder_label,
+                        resume=resume_pipeline,
+                    )
 
         st.subheader("Quick pipeline actions")
         q_col1, q_col2, q_col3 = st.columns(3)
@@ -917,61 +1056,7 @@ with tab_jobs:
                     config["processing"]["skip_mode"] = saved_skip
                     save_config(config)
 
-        pipeline_scope = st.radio(
-            "Pipeline scope",
-            ["Selected folder only", "All library folders"],
-            horizontal=True,
-            help="Run the selected steps on one folder or every folder in your library.",
-        )
-
-        resume_available = can_resume_pipeline()
-        resume_pipeline = False
-        if resume_available:
-            resume_pipeline = st.checkbox(
-                "Resume from last failed/stopped pipeline",
-                value=False,
-                key="resume_pipeline_checkbox",
-                help="Continues from the step where the previous pipeline stopped or failed.",
-            )
-            st.info("A previous pipeline can be resumed from where it stopped.")
-        elif "resume_pipeline_checkbox" in st.session_state:
-            st.session_state["resume_pipeline_checkbox"] = False
-
-        run_pipeline = st.button(
-            "Run Selected Pipeline",
-            type="primary",
-            disabled=selected_count == 0 or not env_ready,
-        )
-
-        if run_pipeline:
-            if selected_count == 0:
-                st.warning("Select at least one pipeline step.")
-            else:
-                webhook = config.get("notifications", {}).get("discord_webhook_url", "").strip()
-                if not webhook:
-                    st.caption("Tip: add a Discord webhook under **Tools / Status** for pipeline completion alerts.")
-                if pipeline_scope == "All library folders":
-                    target_folders = list(config["folders"])
-                    folder_label = "All_Folders"
-                    anchor_folder = target_folders[0]
-                else:
-                    target_folders = [selected_folder]
-                    folder_label = None
-                    anchor_folder = selected_folder
-
-                if resume_pipeline and not resume_available:
-                    st.warning("Nothing to resume.")
-                else:
-                    clear_pipeline_video_filter()
-                    run_pipeline_job(
-                        config,
-                        target_folders,
-                        anchor_folder,
-                        folder_label,
-                        resume=resume_pipeline,
-                    )
-
-        st.caption("Live job progress is on the **Dashboard** tab (auto-refreshes every 2 seconds).")
+        st.caption("Live job progress is on the **Dashboard** tab (auto-refreshes every second).")
 
         if st.button("Clear Job History", key="jobs_clear_history"):
             for job in JOBS_DIR.glob("*.json"):
@@ -1027,26 +1112,27 @@ with tab_search:
     min_score = 0.0
     extension_filter = ""
 
-    with st.expander("Search filters", expanded=False):
-        filter_col1, filter_col2, filter_col3 = st.columns(3)
+    if config["folders"]:
+        search_scope = st.selectbox(
+            "Folder",
+            ["All folders"] + config["folders"],
+            index=(
+                config["folders"].index(config["selected_folder"]) + 1
+                if config["selected_folder"] in config["folders"]
+                else 0
+            ),
+            key="search_folder_filter",
+            help="Limit search results to one library folder, or search across all folders.",
+        )
+        if search_scope != "All folders":
+            search_folder = search_scope
+    else:
+        st.info("Add a folder on the Library tab to enable folder-scoped search.")
 
-        search_folder = None
+    with st.expander("More search filters", expanded=False):
+        filter_col1, filter_col2 = st.columns(2)
+
         with filter_col1:
-            if config["folders"]:
-                search_scope = st.selectbox(
-                    "Folder",
-                    ["All folders"] + config["folders"],
-                    index=(
-                        config["folders"].index(config["selected_folder"]) + 1
-                        if config["selected_folder"] in config["folders"]
-                        else 0
-                    ),
-                    key="search_folder_filter",
-                )
-                if search_scope != "All folders":
-                    search_folder = search_scope
-
-        with filter_col2:
             use_date_from = st.checkbox("Modified from", key="use_search_date_from")
             date_from = (
                 st.date_input("Modified from", key="search_date_from")
@@ -1054,7 +1140,7 @@ with tab_search:
                 else None
             )
 
-        with filter_col3:
+        with filter_col2:
             use_date_to = st.checkbox("Modified to", key="use_search_date_to")
             date_to = (
                 st.date_input("Modified to", key="search_date_to")
@@ -1213,7 +1299,7 @@ with tab_search:
 
 with tab_tools:
     job_banner_tools()
-    st.header("Tools / Status")
+    st.header("Tools / System")
 
     if config.get("setup_wizard_complete") and st.button("Show setup wizard again"):
         config["setup_wizard_complete"] = False
@@ -1373,7 +1459,14 @@ with tab_tools:
 
     st.subheader("Dependency Manager")
 
-    if st.button("Install / Update AI Dependencies", disabled=bool(running_job_summary())):
+    running_job = running_job_summary()
+    if running_job:
+        st.caption(
+            f"Install is disabled while **{running_job}** is running. "
+            "Stop it on the Dashboard first."
+        )
+
+    if st.button("Install / Update AI Dependencies", disabled=bool(running_job)):
         run_script("install_dependencies.py", config.get("selected_folder", ""))
 
     dependency_jobs = [

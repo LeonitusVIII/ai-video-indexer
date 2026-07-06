@@ -38,15 +38,11 @@ LEGACY_REVIEW_DIR = "_OLD_FILES_REVIEW"
 
 
 def add_normalize_args(parser):
-    parser.add_argument("--dry-run", choices=["true", "false"], default="false")
     parser.add_argument("--overwrite", choices=["true", "false"], default="false")
 
 
-def run_cmd(cmd, dry_run):
+def run_cmd(cmd):
     print("RUN:", " ".join(str(x) for x in cmd), flush=True)
-    if dry_run:
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -57,10 +53,7 @@ def run_cmd(cmd, dry_run):
     )
 
 
-def ffprobe_ok(path, dry_run):
-    if dry_run:
-        return True
-
+def ffprobe_ok(path):
     result = subprocess.run(
         [
             "ffprobe",
@@ -78,7 +71,7 @@ def ffprobe_ok(path, dry_run):
     return result.returncode == 0
 
 
-def remux_to_mkv(src, dst, dry_run):
+def remux_to_mkv(src, dst):
     cmd = [
         "ffmpeg",
         "-y",
@@ -90,13 +83,13 @@ def remux_to_mkv(src, dst, dry_run):
         str(dst),
     ]
 
-    result = run_cmd(cmd, dry_run)
+    result = run_cmd(cmd)
     if result.returncode != 0:
         return False, result.stderr
     return True, ""
 
 
-def copy_sidecars(src, dst, dry_run):
+def copy_sidecars(src, dst):
     copied = []
 
     for suffix in SIDECAR_SUFFIXES:
@@ -106,23 +99,21 @@ def copy_sidecars(src, dst, dry_run):
         if old_sidecar.exists():
             print(f"COPY SIDECAR: {old_sidecar} -> {new_sidecar}", flush=True)
             copied.append(str(new_sidecar))
-            if not dry_run:
-                shutil.copy2(old_sidecar, new_sidecar)
+            shutil.copy2(old_sidecar, new_sidecar)
 
     return copied
 
 
-def delete_original_and_old_sidecars(src, dry_run):
+def delete_original_and_old_sidecars(src):
     print(f"DELETE ORIGINAL: {src}", flush=True)
-    if not dry_run and src.exists():
+    if src.exists():
         src.unlink()
 
     for suffix in SIDECAR_SUFFIXES:
         old_sidecar = Path(str(src) + suffix)
         if old_sidecar.exists():
             print(f"DELETE OLD SIDECAR: {old_sidecar}", flush=True)
-            if not dry_run:
-                old_sidecar.unlink()
+            old_sidecar.unlink()
 
 
 def should_skip(src):
@@ -292,7 +283,6 @@ def main():
 
     folder = Path(args.folder)
     status_file = Path(args.status_file)
-    dry_run = args.dry_run == "true"
     global_overwrite = args.overwrite == "true"
     overwrite = step_overwrite_from_args(args, "normalize", global_overwrite)
     skip_mode = skip_mode_from_args(args)
@@ -310,7 +300,6 @@ def main():
         "percent": 0,
         "processed": 0,
         "total": 0,
-        "dry_run": dry_run,
     })
     write_status(status_file, status)
 
@@ -340,7 +329,6 @@ def main():
             + ", ".join(sorted(OLD_EXTENSIONS)),
             flush=True,
         )
-    print(f"DRY_RUN = {dry_run}", flush=True)
 
     status.update({
         "total": total,
@@ -348,9 +336,8 @@ def main():
     })
     write_status(status_file, status)
 
-    if not dry_run:
-        reconcile_stale_records(args.db, folder)
-        print("Reconciled stale library records.", flush=True)
+    reconcile_stale_records(args.db, folder)
+    print("Reconciled stale library records.", flush=True)
 
     converted_rows = []
     failed_rows = []
@@ -378,20 +365,19 @@ def main():
 
         if dst.exists() and not overwrite:
             print(f"SKIP: MKV already exists: {dst}", flush=True)
-            if not dry_run:
-                migrate_video_record(args.db, src, dst)
-                if src.exists():
-                    delete_original_and_old_sidecars(src, dry_run)
-                converted_rows.append({
-                    "source_original": str(src),
-                    "new_mkv": str(dst),
-                    "copied_sidecars": "already converted",
-                })
+            migrate_video_record(args.db, src, dst)
+            if src.exists():
+                delete_original_and_old_sidecars(src)
+            converted_rows.append({
+                "source_original": str(src),
+                "new_mkv": str(dst),
+                "copied_sidecars": "already converted",
+            })
         else:
             print(f"\nCONVERTING: {src}", flush=True)
             print(f"TO:         {dst}", flush=True)
 
-            ok, error = remux_to_mkv(src, dst, dry_run)
+            ok, error = remux_to_mkv(src, dst)
 
             if not ok:
                 print(f"FAILED CONVERT: {src}", flush=True)
@@ -400,7 +386,7 @@ def main():
                     "target": str(dst),
                     "error": error[-2000:] if error else "",
                 })
-            elif not ffprobe_ok(dst, dry_run):
+            elif not ffprobe_ok(dst):
                 print(f"FAILED VERIFY: {dst}", flush=True)
                 failed_rows.append({
                     "source": str(src),
@@ -408,16 +394,15 @@ def main():
                     "error": "ffprobe verification failed",
                 })
             else:
-                copied_sidecars = copy_sidecars(src, dst, dry_run)
-                delete_original_and_old_sidecars(src, dry_run)
+                copied_sidecars = copy_sidecars(src, dst)
+                delete_original_and_old_sidecars(src)
 
-                if not dry_run:
-                    try:
-                        migrate_video_record(args.db, src, dst)
-                    except sqlite3.IntegrityError:
-                        print(f"DB reconcile retry for: {src}", flush=True)
-                        reconcile_stale_records(args.db, folder)
-                        migrate_video_record(args.db, src, dst)
+                try:
+                    migrate_video_record(args.db, src, dst)
+                except sqlite3.IntegrityError:
+                    print(f"DB reconcile retry for: {src}", flush=True)
+                    reconcile_stale_records(args.db, folder)
+                    migrate_video_record(args.db, src, dst)
 
                 converted_rows.append({
                     "source_original": str(src),
@@ -434,7 +419,7 @@ def main():
         })
         write_status(status_file, status)
 
-    if not dry_run and (converted_rows or failed_rows):
+    if converted_rows or failed_rows:
         print("\nWriting logs...", flush=True)
 
         with open(convert_log, "w", newline="", encoding="utf-8") as f:
@@ -459,8 +444,6 @@ def main():
     summary = (
         f"Normalize complete. Converted: {len(converted_rows)}, failed: {len(failed_rows)}."
     )
-    if dry_run:
-        summary += " Dry run only — no file changes were made."
 
     status.update({
         "status": "complete",
@@ -472,8 +455,6 @@ def main():
 
     print(f"\nDone. Converted: {len(converted_rows)}", flush=True)
     print(f"Failed:    {len(failed_rows)}", flush=True)
-    if dry_run:
-        print("\nThis was a dry run. Uncheck dry run in the app to apply changes.", flush=True)
 
 
 if __name__ == "__main__":

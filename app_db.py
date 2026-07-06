@@ -9,6 +9,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from job_utils import metadata_json_path, transcript_json_path, vision_json_path
+from pipeline_utils import vision_output_complete
 
 DB_FILE = Path(__file__).resolve().parent / "data" / "video_indexer.db"
 
@@ -97,7 +98,7 @@ def sidecar_flags_for_video(video_path):
     path = Path(video_path)
     return {
         "has_transcript": int(transcript_json_path(path).exists()),
-        "has_vision": int(vision_json_path(path).exists()),
+        "has_vision": int(vision_output_complete(vision_json_path(path))),
         "has_metadata": int(metadata_json_path(path).exists()),
     }
 

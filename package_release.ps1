@@ -15,6 +15,7 @@ $IncludeFiles = @(
     "app_wizard.py",
     "app_help.py",
     "app_db.py",
+    "pipeline_estimate.py",
     "search_engine.py",
     "notifications.py",
     "README.md",

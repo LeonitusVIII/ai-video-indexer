@@ -9,14 +9,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from job_utils import add_processing_args, read_status, should_stop, write_status
+from pipeline_utils import clear_all_failures, load_failures
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = APP_DIR / "data"
+CONFIG_FILE = APP_DIR / "config.json"
 RESUME_FILE = DATA_DIR / "pipeline_resume.json"
 PYTHON = APP_DIR / "venv" / "Scripts" / "python.exe"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
-SCAN_STEP = ("scan", "scan_library.py", "Scan library")
+SCAN_STEP = ("scan", "scan_library.py", "Rescan library")
 
 PIPELINE_STEPS = [
     ("normalize", "normalize_videos.py", "Normalize old videos"),
@@ -29,15 +31,13 @@ PIPELINE_STEPS = [
 
 def add_pipeline_args(parser):
     add_processing_args(parser)
-    parser.add_argument("--dry-run", choices=["true", "false"], default="false")
     parser.add_argument("--folders-file", default="")
     parser.add_argument("--resume", choices=["true", "false"], default="false")
-    parser.add_argument("--discord-webhook", default="")
     parser.add_argument(
-        "--scan-first",
+        "--scan-after",
         choices=["true", "false"],
-        default="false",
-        help="Run library scan as the first pipeline step for each folder.",
+        default="true",
+        help="Run library scan after all processing steps for each folder.",
     )
     parser.add_argument(
         "--skip-mode",
@@ -59,14 +59,13 @@ def step_enabled(args, step_key):
 
 
 def enabled_steps(args):
-    steps = []
-    if getattr(args, "scan_first", "false") == "true":
-        steps.append(SCAN_STEP)
-    steps.extend([
+    steps = [
         (key, script, label)
         for key, script, label in PIPELINE_STEPS
         if step_enabled(args, key)
-    ])
+    ]
+    if getattr(args, "scan_after", "true") == "true":
+        steps.append(SCAN_STEP)
     return steps
 
 
@@ -132,7 +131,6 @@ def build_step_cmd(args, folder, script_name, step_status_file):
 
     if script_name == "normalize_videos.py":
         cmd.extend([
-            "--dry-run", args.dry_run,
             "--overwrite", args.overwrite,
         ])
     else:
@@ -141,6 +139,8 @@ def build_step_cmd(args, folder, script_name, step_status_file):
             "--overwrite", args.overwrite,
             "--vision-interval", str(args.vision_interval),
             "--min-frames", str(args.min_frames),
+            "--transcription-model", args.transcription_model,
+            "--vision-model", args.vision_model,
         ])
 
     cmd.extend(["--skip-mode", args.skip_mode])
@@ -270,18 +270,34 @@ def run_step(
     return "complete"
 
 
-def send_discord(args, event, folder_label, details, log_file, status_file):
-    webhook = args.discord_webhook
+def load_notification_settings():
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return config.get("notifications") or {}
+
+
+def count_pipeline_failures():
+    failures = load_failures()
+    return sum(len(steps) for steps in failures.values())
+
+
+def send_discord(event, folder_label, details, log_file):
+    settings = load_notification_settings()
+    webhook = (settings.get("discord_webhook_url") or "").strip()
     if not webhook:
         return
 
-    notify_settings = read_status(status_file).get("notifications", {})
     flag_name = {
         "complete": "notify_on_complete",
+        "complete_with_failures": "notify_on_complete",
         "failed": "notify_on_failed",
         "stopped": "notify_on_stopped",
     }.get(event)
-    if flag_name and not notify_settings.get(flag_name, True):
+    if flag_name and not settings.get(flag_name, True):
         return
 
     sys.path.insert(0, str(APP_DIR))
@@ -336,6 +352,9 @@ def main():
     step_keys = [key for key, _, _ in steps]
     total_units = total_work_units(len(folders), len(steps))
 
+    if args.resume != "true":
+        clear_all_failures()
+
     start_folder_index, start_step_index = resume_start_point(args, folders, steps)
 
     status = initial_status
@@ -376,7 +395,7 @@ def main():
 
     if not steps:
         finalize_status(status_file, status, "failed", 0, total_units, "No pipeline steps selected.")
-        send_discord(args, "failed", folder_label, "No pipeline steps selected.", log_file, status_file)
+        send_discord("failed", folder_label, "No pipeline steps selected.", log_file)
         sys.exit(1)
 
     completed_units = (start_folder_index * len(steps)) + start_step_index
@@ -398,7 +417,7 @@ def main():
                     f"Stopped before {folder_name} — {step_label}",
                     resume_state,
                 )
-                send_discord(args, "stopped", folder_label, status["current"], log_file, status_file)
+                send_discord("stopped", folder_label, status["current"], log_file)
                 sys.exit(0)
 
             status = read_status(status_file)
@@ -439,7 +458,7 @@ def main():
                     f"Stopped during {folder_name} — {step_label}",
                     resume_state,
                 )
-                send_discord(args, "stopped", folder_label, status["current"], log_file, status_file)
+                send_discord("stopped", folder_label, status["current"], log_file)
                 sys.exit(0)
 
             if result == "failed":
@@ -450,7 +469,7 @@ def main():
                     f"Failed during {folder_name} — {step_label}",
                     resume_state,
                 )
-                send_discord(args, "failed", folder_label, status["current"], log_file, status_file)
+                send_discord("failed", folder_label, status["current"], log_file)
                 sys.exit(1)
 
             completed_units += 1
@@ -470,7 +489,18 @@ def main():
 
         start_step_index = 0
 
-    message = f"Pipeline complete ({len(folders)} folder(s), {len(steps)} step(s) each)."
+    failure_count = count_pipeline_failures()
+    if failure_count:
+        message = (
+            f"Pipeline finished with {failure_count} per-video failure(s) "
+            f"({len(folders)} folder(s), {len(steps)} step(s) each). "
+            "See Tools/System or pipeline_failures.json for details."
+        )
+        event = "complete_with_failures"
+    else:
+        message = f"Pipeline complete ({len(folders)} folder(s), {len(steps)} step(s) each)."
+        event = "complete"
+
     finalize_status(
         status_file,
         read_status(status_file),
@@ -481,7 +511,7 @@ def main():
         resume_state,
     )
     clear_resume_state()
-    send_discord(args, "complete", folder_label, message, log_file, status_file)
+    send_discord(event, folder_label, message, log_file)
     print(f"\n{message}", flush=True)
 
 

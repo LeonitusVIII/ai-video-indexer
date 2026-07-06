@@ -2,6 +2,7 @@
 
 Search your home videos by what was said or what appears on screen. Index files on a local folder or network share, then run semantic search with timestamps and playback links.
 
+**Current release:** [v0.2](https://github.com/LeonitusVIII/ai-video-indexer/releases/tag/v0.2) — see [CHANGELOG.md](CHANGELOG.md) for details.
 ## Requirements
 
 | Requirement | Notes |
@@ -24,7 +25,7 @@ Optional: **VLC** for “Play here” from search results.
 ## First-time workflow
 
 1. **Library** tab — add a folder path (Browse or paste a path like `D:\Videos` or `\\SERVER\Media\Home Videos`).
-2. **Run Jobs** tab — click **Scan Library**, or run the pipeline with **Scan library before pipeline** enabled (default).
+2. **Run Jobs** tab — click **Scan Library** to catalog videos in that folder.
 3. Select pipeline steps (defaults are all on), then **Run Selected Pipeline**.
 4. **Search** tab — try a natural-language query after indexing completes.
 
@@ -32,7 +33,7 @@ Optional: **VLC** for “Play here” from search results.
 
 | Step | What it does |
 |------|----------------|
-| Scan library | Catalog video files in SQLite (optional first pipeline step) |
+| Scan library | Manual only — catalog video files in SQLite (Run Jobs → **Scan Library**) |
 | Normalize old videos | Remux `.mov`, `.vob`, `.avi`, etc. to `.mkv` |
 | Transcribe | Whisper speech-to-text with timestamps |
 | Analyze vision | Qwen2.5-VL frame descriptions |
@@ -43,7 +44,7 @@ Sidecar files (`.transcript.json`, `.vision.json`, etc.) are saved next to each 
 
 ## Discord notifications (optional)
 
-**Tools / Status** → paste your own Discord webhook URL. Nothing is sent unless you configure it.
+**Tools/System** → paste your own Discord webhook URL. Nothing is sent unless you configure it.
 
 ## Troubleshooting
 

@@ -66,32 +66,18 @@ def format_duration(seconds):
     return f"{secs}s"
 
 
-def compute_job_eta(job):
-    if job.get("status") != "running":
-        return None
-
+def compute_job_elapsed(job):
+    """Elapsed wall time for a job (running now, or total if finished)."""
     started = parse_iso_datetime(job.get("started_at"))
-    processed = int(job.get("processed", 0))
-    total = int(job.get("total", 0))
-
-    if not started or total <= 0:
+    if not started:
         return None
 
-    elapsed = (datetime.datetime.now() - started).total_seconds()
-    if elapsed <= 0:
-        return None
+    finished = parse_iso_datetime(job.get("finished_at"))
+    if finished:
+        return format_duration((finished - started).total_seconds())
 
-    if processed > 0:
-        remaining_units = max(total - processed, 0)
-        rate = processed / elapsed
-        if rate <= 0:
-            return None
-        return format_duration(remaining_units / rate)
-
-    percent = int(job.get("percent", 0))
-    if percent > 0:
-        total_estimated = elapsed * 100 / percent
-        return format_duration(max(total_estimated - elapsed, 0))
+    if job.get("status") == "running":
+        return format_duration((datetime.datetime.now() - started).total_seconds())
 
     return None
 
@@ -295,3 +281,48 @@ def open_video_at_timestamp(video_path, start_seconds):
 
     os.startfile(str(path))
     return True, "Opened video (could not jump to timestamp — install VLC for timed playback)"
+
+
+def find_vision_resume_mismatches(config, folder_prefixes):
+    """Videos with partial vision output that don't match current vision settings."""
+    import json
+
+    from job_utils import (
+        DEFAULT_VISION_MODEL_KEY,
+        VISION_MODEL_OPTIONS,
+        find_videos,
+        vision_json_path,
+    )
+
+    processing = config.get("processing") or {}
+    vision_key = processing.get("vision_model", DEFAULT_VISION_MODEL_KEY)
+    if vision_key not in VISION_MODEL_OPTIONS:
+        vision_key = DEFAULT_VISION_MODEL_KEY
+    model_id = VISION_MODEL_OPTIONS[vision_key]["model_id"]
+    interval = int(processing.get("vision_frame_interval_seconds", 30))
+    min_frames = int(processing.get("min_frames_per_video", 3))
+
+    mismatches = []
+    seen = set()
+    for folder in folder_prefixes or []:
+        for video in find_videos(folder):
+            video = str(video)
+            if video in seen:
+                continue
+            seen.add(video)
+            sidecar = vision_json_path(video)
+            if not sidecar.exists():
+                continue
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("status") == "complete" or not data.get("frames"):
+                continue
+            if (
+                data.get("model") != model_id
+                or int(data.get("frame_interval_seconds") or 0) != interval
+                or int(data.get("min_frames_per_video") or 0) != min_frames
+            ):
+                mismatches.append(video)
+    return mismatches

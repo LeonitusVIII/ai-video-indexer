@@ -12,7 +12,27 @@ APP_DIR = Path(__file__).resolve().parent.parent
 QDRANT_DIR = APP_DIR / "data" / "qdrant"
 COLLECTION_NAME = "video_segments"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-VISION_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+VISION_MODEL_OPTIONS = {
+    "qwen2.5-vl-3b": {
+        "label": "Qwen2.5-VL 3B (recommended, ~6 GB VRAM)",
+        "model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "family": "qwen2_5_vl",
+    },
+    "qwen2.5-vl-7b": {
+        "label": "Qwen2.5-VL 7B (higher quality, ~16 GB VRAM)",
+        "model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "family": "qwen2_5_vl",
+    },
+    "qwen2-vl-2b": {
+        "label": "Qwen2-VL 2B (fastest, lower VRAM)",
+        "model_id": "Qwen/Qwen2-VL-2B-Instruct",
+        "family": "qwen2_vl",
+    },
+}
+
+DEFAULT_VISION_MODEL_KEY = "qwen2.5-vl-3b"
+VISION_MODEL = VISION_MODEL_OPTIONS[DEFAULT_VISION_MODEL_KEY]["model_id"]
 
 
 def read_status(status_file):
@@ -159,6 +179,22 @@ def add_processing_args(parser):
     parser.add_argument("--vision-interval", type=int, default=30)
     parser.add_argument("--min-frames", type=int, default=3)
     parser.add_argument("--transcription-model", default="large-v3")
+    parser.add_argument("--vision-model", default=DEFAULT_VISION_MODEL_KEY)
+
+
+def vision_model_key_from_args(args):
+    key = getattr(args, "vision_model", DEFAULT_VISION_MODEL_KEY) or DEFAULT_VISION_MODEL_KEY
+    if key in VISION_MODEL_OPTIONS:
+        return key
+    for option_key, option in VISION_MODEL_OPTIONS.items():
+        if option["model_id"] == key:
+            return option_key
+    return DEFAULT_VISION_MODEL_KEY
+
+
+def vision_model_config_from_args(args):
+    key = vision_model_key_from_args(args)
+    return VISION_MODEL_OPTIONS[key]
 
 
 def transcription_model_from_args(args):

@@ -14,7 +14,7 @@ from ml_bootstrap import prepare_ml_environment
 
 APP_DIR = Path(__file__).resolve().parent
 DB_FILE = APP_DIR / "data" / "video_indexer.db"
-JOBS_DIR = APP_DIR / "data" / "jobs"
+JOBS_DIR = APP_DIR / "jobs"
 
 _PIPELINE_STEP_SUFFIXES = (
     "_scan",
@@ -526,7 +526,7 @@ def search_videos(
             if skipped_stale:
                 return [], (
                     "No matching segments in the current library. "
-                    "Stale index entries were ignored — try **Reset search index** under Tools / Status, "
+                    "Stale index entries were ignored — try **Reset search index** under Tools/System, "
                     "then run **Index search DB** again."
                 )
             return [], "No matching segments found."

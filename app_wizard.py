@@ -87,7 +87,7 @@ def render_setup_wizard(config, app_dir, save_config_fn):
     if st.button("Mark setup complete", type="primary"):
         config = mark_wizard_complete(config)
         save_config_fn(config)
-        st.success("Setup wizard dismissed. You can reopen it from Tools / Status.")
+        st.success("Setup wizard dismissed. You can reopen it from Tools/System.")
         st.rerun()
 
     return config

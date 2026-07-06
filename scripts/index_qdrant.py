@@ -46,7 +46,7 @@ def load_embedder():
     except Exception as e:
         raise RuntimeError(
             "Could not load sentence-transformers embedding model. "
-            "Run Install / Update AI Dependencies from the Tools tab. "
+            "Run Install / Update AI Dependencies from the Tools/System tab. "
             f"({e})"
         ) from e
 
