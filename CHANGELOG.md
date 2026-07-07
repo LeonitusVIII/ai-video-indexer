@@ -2,6 +2,33 @@
 
 All notable changes to AI Video Indexer are documented here.
 
+## [0.2.1] — 2026-07-07
+
+### Added
+
+- **Single-file pipeline** — select one or more videos on the Library tab or Run Jobs and run the pipeline on just those files.
+- **Duplicate detection** — scan stores duration and content fingerprint; Library and Tools/System show duplicate groups.
+- **Search debug log** — Search tab expander plus `logs/search.log` with index stats, Qdrant hit counts, filter breakdown, and sample reject reasons.
+- **Search export** — download results as CSV or Markdown after a query.
+- **Person tags** — metadata extracts people-related tags from vision/transcript text for search (description-based, not face recognition).
+- **Thumbnails** — `.thumbnail.jpg` sidecar on scan; preview column in Library; frame-at-hit preview in Search results.
+- **Whisper language in Library** — auto-detected per-file language shown in the catalog table.
+- **Resume step mismatch warning** — explains when pipeline step checkboxes changed since a stopped run (resume restarts from the beginning).
+- **Vision dependency check** — Run Jobs warns and offers **Install vision dependencies** when the vision stack is missing.
+- **Live install progress** — Install / Update AI Dependencies shows step progress on Dashboard and Tools/System (auto-refreshing).
+
+### Changed
+
+- **`start.bat`** — opens the default browser to `http://localhost:8501` after launch.
+- **Logs tab** — removed broken auto-refresh fragment that could collapse all tabs; optional auto-refresh checkbox instead.
+- **Install scripts** — preserve job metadata (`pid`, `log_file`, etc.) so Dashboard tracking works for dependency installs.
+
+### Fixed
+
+- **White screen on Run Jobs** — `find_vision_resume_mismatches` no longer passes strings where `Path` objects are required; failures show a caption instead of crashing the app.
+- **Install progress invisible on Dashboard** — dependency install no longer wipes the job status file and get marked failed immediately.
+- **Search troubleshooting** — debug log makes “no results” diagnosable (empty index, filters, stale paths, min score, etc.).
+
 ## [0.2] — 2026-07-06
 
 ### Added

@@ -19,6 +19,7 @@ $IncludeFiles = @(
     "search_engine.py",
     "notifications.py",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "requirements.txt",
     "config.example.json",

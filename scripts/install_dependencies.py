@@ -5,9 +5,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def write_status(status_file, status):
-    Path(status_file).write_text(json.dumps(status, indent=2), encoding="utf-8")
+from job_utils import read_status, should_stop, write_status
 
 
 def run_step(name, cmd, status, status_file, optional=False):
@@ -20,9 +20,12 @@ def run_step(name, cmd, status, status_file, optional=False):
     result = subprocess.run(cmd, text=True)
 
     if result.returncode != 0 and not optional:
-        status["status"] = "failed"
-        status["current"] = f"Failed: {name}"
-        status["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        status = read_status(status_file)
+        status.update({
+            "status": "failed",
+            "current": f"Failed: {name}",
+            "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
         write_status(status_file, status)
         sys.exit(result.returncode)
 
@@ -127,19 +130,32 @@ def main():
     python = sys.executable
     steps = build_steps(python)
 
-    status = {
+    status = read_status(status_file)
+    status.update({
         "status": "running",
         "percent": 0,
         "processed": 0,
         "total": len(steps),
         "current": "Starting dependency install",
-        "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "finished_at": "",
-        "stop_requested": False,
-    }
+        "stop_requested": status.get("stop_requested", False),
+    })
+    if not status.get("started_at"):
+        status["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    status["finished_at"] = ""
     write_status(status_file, status)
 
     for i, step in enumerate(steps, start=1):
+        if should_stop(status_file):
+            status = read_status(status_file)
+            status.update({
+                "status": "stopped",
+                "current": "Stopped by user.",
+                "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+            write_status(status_file, status)
+            print("Stopped by user.", flush=True)
+            sys.exit(0)
+
         if len(step) == 3:
             name, cmd, optional = step
         else:
@@ -152,14 +168,18 @@ def main():
 
         run_step(name, cmd, status, status_file, optional=optional)
 
+        status = read_status(status_file)
         status["processed"] = i
         status["percent"] = int((i / len(steps)) * 100)
         write_status(status_file, status)
 
-    status["status"] = "complete"
-    status["percent"] = 100
-    status["current"] = "Dependency install complete"
-    status["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    status = read_status(status_file)
+    status.update({
+        "status": "complete",
+        "percent": 100,
+        "current": "Dependency install complete",
+        "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
     write_status(status_file, status)
 
     print("\nDependency install complete.", flush=True)

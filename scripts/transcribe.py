@@ -30,7 +30,23 @@ from pipeline_utils import (
 )
 
 
-def update_video_transcript_status(db, video_path):
+def load_transcript_language(json_file):
+    if not json_file.exists():
+        return None
+    try:
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data.get("language")
+
+
+def update_video_transcript_status(db, video_path, language=None):
+    if language:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from app_db import update_video_transcript_language
+
+        update_video_transcript_language(db, video_path, language)
+        return
     con = sqlite3.connect(db)
     cur = con.cursor()
     cur.execute(
@@ -148,7 +164,8 @@ def main():
             and step_status(row, "transcribe") == "complete"
         ):
             print(f"Skipping existing transcript: {video}", flush=True)
-            update_video_transcript_status(args.db, video)
+            language = load_transcript_language(json_file)
+            update_video_transcript_status(args.db, video, language)
         else:
             status.update({
                 "current": f"Transcribing: {video}",
@@ -210,10 +227,10 @@ def main():
                     encoding="utf-8"
                 )
 
-                update_video_transcript_status(args.db, video)
+                update_video_transcript_status(args.db, video, info.language)
                 clear_step_failure(video, "transcribe")
 
-                print(f"Completed: {video}", flush=True)
+                print(f"Completed: {video} (language: {info.language})", flush=True)
 
             except Exception as e:
                 record_step_failure(video, "transcribe", str(e))

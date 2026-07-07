@@ -9,6 +9,7 @@ data/*.db
 data/*.json
 !data/.gitkeep
 data/qdrant/
+data/thumbnails/
 
 jobs/
 !jobs/.gitkeep

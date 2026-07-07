@@ -2,7 +2,7 @@
 
 Search your home videos by what was said or what appears on screen. Index files on a local folder or network share, then run semantic search with timestamps and playback links.
 
-**Current release:** [v0.2](https://github.com/LeonitusVIII/ai-video-indexer/releases/tag/v0.2) — see [CHANGELOG.md](CHANGELOG.md) for details.
+**Current release:** [v0.2.1](https://github.com/LeonitusVIII/ai-video-indexer/releases/tag/v0.2.1) — see [CHANGELOG.md](CHANGELOG.md) for details.
 ## Requirements
 
 | Requirement | Notes |

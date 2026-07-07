@@ -19,6 +19,7 @@ from job_utils import (
     vision_json_path,
     write_status,
 )
+from person_tags import extract_people_tags
 from pipeline_utils import (
     add_pipeline_control_args,
     clear_step_failure,
@@ -97,7 +98,7 @@ def build_search_chunks(transcript_data, vision_data, interval_seconds):
     return chunks
 
 
-def build_metadata_for_video(video, interval_seconds):
+def build_metadata_for_video(video, interval_seconds, *, enable_person_tags=True):
     transcript_data = load_json(transcript_json_path(video))
     vision_data = load_json(vision_json_path(video))
 
@@ -106,9 +107,20 @@ def build_metadata_for_video(video, interval_seconds):
     except Exception:
         duration_seconds = (vision_data or {}).get("duration_seconds", 0)
 
+    people_tags = []
+    if enable_person_tags:
+        people_tags = extract_people_tags(vision_data, transcript_data)
+
     search_chunks = build_search_chunks(
         transcript_data, vision_data, interval_seconds
     )
+    if people_tags:
+        search_chunks.insert(0, {
+            "start": 0.0,
+            "end": max(float(duration_seconds or 0), 1.0),
+            "text": "People: " + ", ".join(people_tags),
+            "sources": ["person_tags"],
+        })
 
     stat = video.stat()
     return {
@@ -122,6 +134,8 @@ def build_metadata_for_video(video, interval_seconds):
         "duration_seconds": round(duration_seconds, 3),
         "has_transcript": transcript_data is not None,
         "has_vision": vision_data is not None,
+        "transcript_language": (transcript_data or {}).get("language"),
+        "people_tags": people_tags,
         "transcript": transcript_data,
         "vision": vision_data,
         "search_chunks": search_chunks,
@@ -208,6 +222,11 @@ def main():
                     json.dumps(metadata, indent=2), encoding="utf-8"
                 )
                 update_video_flag(args.db, video, "has_metadata")
+                if metadata.get("people_tags"):
+                    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+                    from app_db import update_video_people_tags
+
+                    update_video_people_tags(args.db, video, metadata["people_tags"])
                 clear_step_failure(video, "metadata")
                 print(
                     f"Created {len(metadata['search_chunks'])} search chunks",

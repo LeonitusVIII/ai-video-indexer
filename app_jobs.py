@@ -17,6 +17,7 @@ PIPELINE_STEP_KEYS = (
 STANDALONE_JOB_LABELS = {
     "scan_library.py": "Scan library",
     "install_dependencies.py": "Install dependencies",
+    "install_model_deps.py": "Install model dependencies",
     "system_check.py": "System check",
 }
 
@@ -100,6 +101,8 @@ def _standalone_progress_unit(job):
     script = job.get("script") or ""
     if script == "scan_library.py":
         return "files"
+    if script in ("install_dependencies.py", "install_model_deps.py"):
+        return "steps"
     return "items"
 
 

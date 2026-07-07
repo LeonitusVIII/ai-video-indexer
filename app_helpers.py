@@ -26,19 +26,77 @@ def step_status_icon(status):
     }.get(status, "·")
 
 
+RESUME_STEP_LABELS = {
+    "normalize": "Normalize old videos",
+    "transcribe": "Transcribe",
+    "vision": "Analyze vision",
+    "metadata": "Build metadata",
+    "index": "Index search DB",
+    "scan": "Rescan library",
+}
+
+THUMB_CACHE_DIR = Path(__file__).resolve().parent / "data" / "thumbnails"
+
+
+def enabled_pipeline_step_keys(config):
+    pipeline = config.get("pipeline") or {}
+    processing = config.get("processing") or {}
+    keys = [
+        key
+        for key in ("normalize", "transcribe", "vision", "metadata", "index")
+        if pipeline.get(key, True)
+    ]
+    if processing.get("scan_after_pipeline", True):
+        keys.append("scan")
+    return keys
+
+
+def format_step_key_list(step_keys):
+    return ", ".join(RESUME_STEP_LABELS.get(key, key) for key in (step_keys or []))
+
+
+def find_resume_step_mismatch(config, resume_state):
+    if not resume_state:
+        return None
+    saved = resume_state.get("step_keys") or []
+    current = enabled_pipeline_step_keys(config)
+    if saved == current:
+        return None
+    return {"saved": saved, "current": current}
+
+
 def videos_status_dataframe(videos):
+    import json
     import pandas as pd
 
     rows = []
     for video in videos:
+        duration = video.get("duration_seconds")
+        language = video.get("transcript_language") or ""
+        people_raw = video.get("people_tags")
+        people = ""
+        if people_raw:
+            try:
+                tags = json.loads(people_raw) if isinstance(people_raw, str) else people_raw
+                people = ", ".join(tags[:3])
+                if len(tags) > 3:
+                    people += f" (+{len(tags) - 3})"
+            except Exception:
+                people = ""
+
         row = {
             "File": video.get("filename", ""),
             "Modified": (video.get("modified_time") or "")[:10],
             "Size MB": round((video.get("size_bytes") or 0) / (1024 * 1024), 1),
+            "Duration": format_duration(duration) if duration else "—",
+            "Language": language or "—",
+            "People": people or "—",
         }
         for step_key, label in STEP_LABELS.items():
             row[label] = step_status_icon(step_status(video, step_key))
+        thumb = get_video_thumbnail_path(video.get("path", ""))
         row["Path"] = video.get("path", "")
+        row["Thumbnail"] = str(thumb) if thumb else None
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -305,12 +363,18 @@ def find_vision_resume_mismatches(config, folder_prefixes):
     mismatches = []
     seen = set()
     for folder in folder_prefixes or []:
-        for video in find_videos(folder):
-            video = str(video)
-            if video in seen:
+        if not folder or not Path(folder).exists():
+            continue
+        try:
+            video_paths = find_videos(folder)
+        except Exception:
+            continue
+        for video_path in video_paths:
+            path_str = str(video_path)
+            if path_str in seen:
                 continue
-            seen.add(video)
-            sidecar = vision_json_path(video)
+            seen.add(path_str)
+            sidecar = vision_json_path(video_path)
             if not sidecar.exists():
                 continue
             try:
@@ -324,5 +388,87 @@ def find_vision_resume_mismatches(config, folder_prefixes):
                 or int(data.get("frame_interval_seconds") or 0) != interval
                 or int(data.get("min_frames_per_video") or 0) != min_frames
             ):
-                mismatches.append(video)
+                mismatches.append(path_str)
     return mismatches
+
+
+def get_video_thumbnail_path(video_path):
+    if not video_path:
+        return None
+    from job_utils import thumbnail_path
+
+    path = thumbnail_path(video_path)
+    return path if path.exists() else None
+
+
+def get_search_result_thumbnail(result):
+    import hashlib
+
+    from job_utils import extract_frame_image, thumbnail_path
+
+    video_path = result.get("video_path")
+    if not video_path or not Path(video_path).exists():
+        return None
+
+    start = float(result.get("start") or 0)
+    cache_key = hashlib.md5(f"{video_path}|{start:.1f}".encode("utf-8")).hexdigest()
+    cached = THUMB_CACHE_DIR / f"{cache_key}.jpg"
+    if cached.exists():
+        return cached
+
+    THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        extract_frame_image(video_path, max(start, 0.5), cached)
+        return cached
+    except Exception:
+        fallback = thumbnail_path(video_path)
+        return fallback if fallback.exists() else None
+
+
+def search_results_to_csv(results):
+    import csv
+    import io
+
+    output = io.StringIO()
+    fieldnames = [
+        "filename",
+        "video_path",
+        "start_label",
+        "end_label",
+        "score",
+        "semantic_score",
+        "keyword_score",
+        "text",
+        "sources",
+        "modified_time",
+        "size_bytes",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in results or []:
+        item = dict(row)
+        item["sources"] = ", ".join(item.get("sources") or [])
+        writer.writerow(item)
+    return output.getvalue()
+
+
+def search_results_to_markdown(results, query=""):
+    lines = ["# Video Indexer search results", ""]
+    if query:
+        lines.extend([f"Query: **{query}**", ""])
+    if not results:
+        lines.append("_No results._")
+        return "\n".join(lines)
+
+    for i, result in enumerate(results, start=1):
+        lines.extend([
+            f"## {i}. {result.get('filename', 'Video')}",
+            "",
+            f"- **Time:** {result.get('start_label', '')} – {result.get('end_label', '')}",
+            f"- **Score:** {result.get('score', 0):.0%}",
+            f"- **Path:** `{result.get('video_path', '')}`",
+            "",
+            result.get("text", ""),
+            "",
+        ])
+    return "\n".join(lines)

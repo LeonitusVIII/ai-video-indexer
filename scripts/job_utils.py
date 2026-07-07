@@ -89,6 +89,7 @@ def find_videos(folder):
 
 
 def sidecar_path(video, suffix):
+    video = Path(video)
     return video.with_suffix(video.suffix + suffix)
 
 
@@ -153,6 +154,38 @@ def compute_frame_times(duration, interval_seconds, min_frames):
         round((i + 1) * duration / (min_frames + 1), 3)
         for i in range(min_frames)
     ]
+
+
+def thumbnail_path(video):
+    return sidecar_path(video, ".thumbnail.jpg")
+
+
+def compute_file_fingerprint(video_path, size_bytes=None):
+    import hashlib
+
+    path = Path(video_path)
+    if size_bytes is None:
+        size_bytes = path.stat().st_size
+    digest = hashlib.md5()
+    digest.update(str(size_bytes).encode("utf-8"))
+    with path.open("rb") as handle:
+        digest.update(handle.read(1024 * 1024))
+        if size_bytes > 2 * 1024 * 1024:
+            handle.seek(-1024 * 1024, 2)
+            digest.update(handle.read(1024 * 1024))
+    return digest.hexdigest()
+
+
+def ensure_video_thumbnail(video_path, duration_seconds=None):
+    path = Path(video_path)
+    output = thumbnail_path(path)
+    if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
+        return output
+    if duration_seconds is None:
+        duration_seconds = get_video_duration(path)
+    timestamp = min(max(float(duration_seconds) * 0.1, 1.0), max(float(duration_seconds) - 1, 1.0))
+    extract_frame_image(path, timestamp, output)
+    return output
 
 
 def extract_frame_image(video_path, timestamp_seconds, output_path):

@@ -17,6 +17,8 @@ from search_engine import (
     release_qdrant_client,
     delete_qdrant_points_for_folder,
     prune_orphan_qdrant_points,
+    format_search_log,
+    SEARCH_LOG_FILE,
 )
 from app_db import (
     init_db,
@@ -24,6 +26,7 @@ from app_db import (
     get_library_stats,
     prune_missing_videos,
     remove_folder_from_library,
+    find_duplicate_groups,
 )
 from app_help import render_help_tab, whisper_model_info_popover, vision_model_info_popover
 from app_helpers import (
@@ -38,6 +41,11 @@ from app_helpers import (
     search_result_meta_line,
     format_modified_time,
     find_vision_resume_mismatches,
+    find_resume_step_mismatch,
+    format_step_key_list,
+    get_search_result_thumbnail,
+    search_results_to_csv,
+    search_results_to_markdown,
 )
 from app_jobs import render_job_panel, render_job_status_banner, tail_log_file
 from app_wizard import render_setup_wizard, environment_ready
@@ -48,6 +56,7 @@ SCRIPT_DIR_IMPORT = Path(__file__).parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR_IMPORT))
 from pipeline_utils import filter_videos_by_status, video_has_incomplete_steps, STEP_LABELS
 from job_utils import DEFAULT_VISION_MODEL_KEY, VISION_MODEL_OPTIONS
+from model_deps import missing_vision_packages
 
 APP_DIR = Path(__file__).parent
 CONFIG_FILE = APP_DIR / "config.json"
@@ -385,6 +394,31 @@ def processing_args(config):
     ]
 
 
+def run_model_deps_install(stack):
+    folder = config.get("selected_folder") or str(APP_DIR)
+    return run_script(
+        "install_model_deps.py",
+        folder,
+        extra_args=["--stack", stack],
+    )
+
+
+def start_pipeline_on_videos(config, folder, video_paths, *, resume=False):
+    """Run the configured pipeline on an explicit list of video paths."""
+    if not video_paths:
+        return False
+    filter_file = write_pipeline_video_filter([str(p) for p in video_paths])
+    run_pipeline_job(
+        config,
+        [folder],
+        folder,
+        None,
+        resume=resume,
+        video_filter_file=filter_file,
+    )
+    return True
+
+
 def run_script(script_name, folder, extra_args=None, folder_label=None):
     script_path = SCRIPT_DIR / script_name
     if not script_path.exists():
@@ -541,22 +575,32 @@ def render_dashboard_live():
     col4.metric("Indexed", stats["indexed"])
 
 
-@st.fragment(run_every=datetime.timedelta(seconds=1))
 def render_logs_live():
+    """Log viewer — no @st.fragment here; fragments + selectbox inside tabs break tab layout."""
     logs = sorted(LOG_DIR.glob("*.log"), reverse=True)
 
     if not logs:
         st.info("No logs yet.")
         return
 
-    selected_log = st.selectbox(
-        "Select log",
-        logs,
-        format_func=lambda p: p.name,
-        key="logs_tab_select",
-    )
+    ctrl_col1, ctrl_col2 = st.columns([3, 1])
+    with ctrl_col1:
+        selected_log = st.selectbox(
+            "Select log",
+            logs,
+            format_func=lambda p: p.name,
+            key="logs_tab_select",
+        )
+    with ctrl_col2:
+        auto_refresh = st.checkbox("Auto-refresh", value=False, key="logs_auto_refresh")
 
-    st.caption("Live — refreshes every second.")
+    if auto_refresh:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=2000, limit=None, key="logs_autorefresh_tick")
+        except ImportError:
+            st.caption("Install streamlit-autorefresh for auto-refresh.")
 
     if selected_log.exists():
         try:
@@ -565,13 +609,8 @@ def render_logs_live():
             st.error(f"Could not read log: {e}")
             return
 
-        st.text_area(
-            "Log output (last 400 lines)",
-            content,
-            height=600,
-            disabled=True,
-            key="logs_tab_output",
-        )
+        st.caption(f"Showing last 400 lines of **{selected_log.name}**")
+        st.code(content, language=None)
 
 
 def _render_job_banner(key_prefix):
@@ -593,6 +632,66 @@ job_banner_search = make_job_banner_fragment("bn_search_")
 job_banner_tools = make_job_banner_fragment("bn_tools_")
 job_banner_logs = make_job_banner_fragment("bn_logs_")
 job_banner_help = make_job_banner_fragment("bn_help_")
+
+INSTALL_JOB_SCRIPTS = {"install_dependencies.py", "install_model_deps.py"}
+
+
+def dependency_job_files(running_only=False):
+    jobs = [
+        p for p in latest_job_files(running_only=running_only)
+        if (read_job(p) or {}).get("script") in INSTALL_JOB_SCRIPTS
+        or p.name.startswith("install_dependencies_")
+        or p.name.startswith("install_model_deps_")
+    ]
+    return jobs
+
+
+@st.fragment(run_every=datetime.timedelta(seconds=1))
+def render_dependency_install_status():
+    """Live install progress for Tools/System (mirrors Dashboard job panel)."""
+    running_installs = dependency_job_files(running_only=True)
+    if running_installs:
+        render_job_panel(
+            running_installs,
+            read_job,
+            stop_job,
+            jobs_dir=JOBS_DIR,
+            key_prefix="tools_dep_",
+            empty_message="",
+        )
+        return
+
+    latest = dependency_job_files(running_only=False)
+    if not latest:
+        st.info("No dependency install has run yet.")
+        return
+
+    dep_job_file = latest[0]
+    dep_job = read_job(dep_job_file)
+    if not dep_job:
+        st.info("No dependency install has run yet.")
+        return
+
+    if dep_job.get("status") == "running":
+        render_job_panel(
+            [dep_job_file],
+            read_job,
+            stop_job,
+            jobs_dir=JOBS_DIR,
+            key_prefix="tools_dep_",
+            empty_message="",
+        )
+        return
+
+    st.caption("Latest dependency install")
+    render_job_panel(
+        [dep_job_file],
+        read_job,
+        stop_job,
+        jobs_dir=JOBS_DIR,
+        key_prefix="tools_dep_last_",
+        empty_message="",
+    )
 
 
 init_db(str(DB_FILE))
@@ -715,15 +814,59 @@ with tab_library:
                 key="library_status_filter",
             )
             filtered_videos = filter_videos_by_status(videos, status_filter)
+            status_df = videos_status_dataframe(filtered_videos)
+            display_df = status_df.drop(columns=["Path"])
+            if display_df["Thumbnail"].isna().all():
+                display_df = display_df.drop(columns=["Thumbnail"])
 
             st.dataframe(
-                videos_status_dataframe(filtered_videos),
+                display_df,
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "Path": st.column_config.TextColumn("Path", width="large"),
+                    "Thumbnail": st.column_config.ImageColumn("Preview", width="small"),
                 },
             )
+
+            duplicate_groups = find_duplicate_groups(str(DB_FILE), folder=selected)
+            if duplicate_groups:
+                with st.expander(
+                    f"Possible duplicates ({len(duplicate_groups)} group(s))",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Videos matched by content fingerprint or identical size + duration. "
+                        "Rescan folders to refresh fingerprints."
+                    )
+                    for group in duplicate_groups:
+                        st.markdown(
+                            f"**{group['match_type']}** — "
+                            + ", ".join(v["filename"] for v in group["videos"])
+                        )
+                        for video in group["videos"]:
+                            st.code(video["path"])
+
+            file_options = {v["filename"]: v["path"] for v in filtered_videos}
+            if file_options:
+                st.subheader("Process selected file(s)")
+                selected_names = st.multiselect(
+                    "Choose one or more videos",
+                    options=sorted(file_options.keys()),
+                    help="Run the pipeline steps selected on Run Jobs for only these files.",
+                )
+                single_col1, single_col2 = st.columns([1, 3])
+                with single_col1:
+                    if st.button(
+                        "Run pipeline on selected",
+                        key="library_run_selected_files",
+                        disabled=not selected_names or not env_ready,
+                    ):
+                        paths = [file_options[name] for name in selected_names]
+                        start_pipeline_on_videos(config, selected, paths)
+                        st.success(
+                            f"Started pipeline for {len(paths)} file(s). "
+                            "Track progress on the Dashboard."
+                        )
 
             retry_col1, retry_col2 = st.columns([1, 3])
             with retry_col1:
@@ -830,6 +973,10 @@ with tab_jobs:
                     index=WHISPER_MODELS.index(current_model),
                     help="Larger models are more accurate but slower and use more VRAM. large-v3 is recommended on a GPU.",
                 )
+                st.caption(
+                    "Speech language is auto-detected per video during transcription "
+                    "and shown in the Library tab."
+                )
 
         with settings_col2:
             with st.container(border=True):
@@ -850,6 +997,18 @@ with tab_jobs:
                     format_func=lambda key: VISION_MODEL_OPTIONS[key]["label"],
                     help="Local model used for frame descriptions. Larger models need more VRAM and run slower.",
                 )
+                vision_missing = missing_vision_packages()
+                if vision_missing:
+                    st.warning(
+                        "Vision model dependencies are not installed: "
+                        + ", ".join(vision_missing)
+                    )
+                    if st.button(
+                        "Install vision dependencies",
+                        key="install_vision_deps_btn",
+                        disabled=bool(running_job_summary()),
+                    ):
+                        run_model_deps_install("vision")
 
                 vision_col1, vision_col2 = st.columns(2)
                 with vision_col1:
@@ -933,6 +1092,18 @@ with tab_jobs:
 
         st.caption(f"**{selected_count}** step(s) selected: {step_summary}")
 
+        folder_videos = get_videos(folder=selected_folder)
+        file_pick_options = {v["filename"]: v["path"] for v in folder_videos}
+        if file_pick_options:
+            picked_names = st.multiselect(
+                "Or choose specific file(s) in this folder",
+                options=sorted(file_pick_options.keys()),
+                key="run_jobs_file_picker",
+                help="When set, the pipeline runs only on these files instead of the whole folder.",
+            )
+        else:
+            picked_names = []
+
         pipeline_scope = st.radio(
             "Pipeline scope",
             ["Selected folder only", "All library folders"],
@@ -954,8 +1125,25 @@ with tab_jobs:
                 resume_state = json.loads(RESUME_FILE.read_text(encoding="utf-8"))
                 resume_folders = resume_state.get("folders") or []
             except Exception:
+                resume_state = {}
                 resume_folders = []
-            vision_mismatches = find_vision_resume_mismatches(config, resume_folders)
+            step_mismatch = find_resume_step_mismatch(config, resume_state)
+            if step_mismatch:
+                st.warning(
+                    "Your selected pipeline steps changed since the interrupted run, "
+                    "so resume will **restart from the beginning** instead of continuing "
+                    "mid-pipeline.\n\n"
+                    f"**Previous steps:** {format_step_key_list(step_mismatch['saved'])}\n\n"
+                    f"**Current steps:** {format_step_key_list(step_mismatch['current'])}"
+                )
+            vision_mismatches = []
+            try:
+                vision_mismatches = find_vision_resume_mismatches(config, resume_folders)
+            except Exception as exc:
+                st.caption(
+                    f"Could not check vision resume settings ({exc}). "
+                    "You can still resume the pipeline."
+                )
             if vision_mismatches:
                 st.warning(
                     "Partial vision output exists for "
@@ -997,12 +1185,18 @@ with tab_jobs:
                     st.warning("Nothing to resume.")
                 else:
                     clear_pipeline_video_filter()
+                    video_filter = None
+                    if picked_names:
+                        video_filter = write_pipeline_video_filter(
+                            [file_pick_options[name] for name in picked_names]
+                        )
                     run_pipeline_job(
                         config,
                         target_folders,
                         anchor_folder,
                         folder_label,
                         resume=resume_pipeline,
+                        video_filter_file=video_filter,
                     )
 
         st.subheader("Quick pipeline actions")
@@ -1197,6 +1391,7 @@ with tab_search:
         st.session_state.pop("search_results", None)
         st.session_state.pop("search_error", None)
         st.session_state.pop("search_query", None)
+        st.session_state.pop("search_log", None)
         st.session_state.pop("pending_search_query", None)
         st.rerun()
 
@@ -1207,10 +1402,11 @@ with tab_search:
             st.session_state["search_results"] = []
             st.session_state["search_error"] = "Enter a search query."
             st.session_state["search_query"] = ""
+            st.session_state["search_log"] = None
         else:
             with st.spinner("Searching..."):
                 try:
-                    results, error = search_videos(
+                    results, error, search_log = search_videos(
                         query,
                         limit=result_limit,
                         folder_filter=search_folder,
@@ -1223,15 +1419,23 @@ with tab_search:
                         db_file=str(DB_FILE),
                     )
                 except Exception as e:
-                    results, error = [], str(e)
+                    results, error, search_log = [], str(e), None
 
             st.session_state["search_results"] = results
             st.session_state["search_error"] = error
             st.session_state["search_query"] = query
+            st.session_state["search_log"] = search_log
 
     search_error = st.session_state.get("search_error")
     search_results = st.session_state.get("search_results")
     search_query = st.session_state.get("search_query", "")
+    search_log = st.session_state.get("search_log")
+
+    if search_log:
+        expand_log = bool(search_error or not search_results)
+        with st.expander("Search debug log", expanded=expand_log):
+            st.code(format_search_log(search_log), language=None)
+            st.caption(f"Also appended to **logs/{SEARCH_LOG_FILE.name}** (viewable on the Logs tab).")
 
     if search_error:
         st.warning(search_error)
@@ -1241,14 +1445,36 @@ with tab_search:
             + (f" for **{search_query}**" if search_query else "")
         )
 
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            st.download_button(
+                "Export CSV",
+                data=search_results_to_csv(search_results),
+                file_name="search_results.csv",
+                mime="text/csv",
+                key="export_search_csv",
+            )
+        with export_col2:
+            st.download_button(
+                "Export Markdown",
+                data=search_results_to_markdown(search_results, search_query),
+                file_name="search_results.md",
+                mime="text/markdown",
+                key="export_search_md",
+            )
+
         for i, result in enumerate(search_results, start=1):
             preview = search_result_preview_text(result)
             meta_line = html.escape(search_result_meta_line(result))
             path_exists = Path(result["video_path"]).exists()
+            thumb_path = get_search_result_thumbnail(result)
 
             with st.container(border=True):
-                header_col1, header_col2, header_col3 = st.columns([5, 2, 1])
-                with header_col1:
+                top_col1, top_col2, top_col3, top_col4 = st.columns([1, 4, 2, 1])
+                with top_col1:
+                    if thumb_path:
+                        st.image(str(thumb_path), use_container_width=True)
+                with top_col2:
                     safe_name = html.escape(result["filename"])
                     st.markdown(
                         f'<div class="search-result-block">'
@@ -1259,12 +1485,12 @@ with tab_search:
                     )
                     if not path_exists:
                         st.warning("Video file not found at indexed path.")
-                with header_col2:
+                with top_col3:
                     st.markdown(
                         format_search_score_badge(result["score"]),
                         unsafe_allow_html=True,
                     )
-                with header_col3:
+                with top_col4:
                     if st.button("Play", key=f"play_{i}", use_container_width=True):
                         ok, message = open_video_at_timestamp(
                             result["video_path"],
@@ -1322,6 +1548,23 @@ with tab_tools:
                 st.success(f"Removed {removed} orphan search segments.")
             else:
                 st.info("Search index is already consistent with the catalog.")
+
+    all_duplicates = find_duplicate_groups(str(DB_FILE))
+    if all_duplicates:
+        with st.expander(
+            f"Possible duplicates library-wide ({len(all_duplicates)} group(s))",
+            expanded=False,
+        ):
+            st.caption(
+                "Matched by content fingerprint or identical size + duration across all folders."
+            )
+            for group in all_duplicates[:25]:
+                st.markdown(
+                    f"**{group['match_type']}** — "
+                    + ", ".join(v["filename"] for v in group["videos"])
+                )
+            if len(all_duplicates) > 25:
+                st.caption(f"...and {len(all_duplicates) - 25} more groups.")
 
     st.subheader("Paths")
     st.write("Project folder:")
@@ -1460,57 +1703,16 @@ with tab_tools:
     st.subheader("Dependency Manager")
 
     running_job = running_job_summary()
-    if running_job:
+    if running_job and running_job not in INSTALL_JOB_SCRIPTS:
         st.caption(
             f"Install is disabled while **{running_job}** is running. "
             "Stop it on the Dashboard first."
         )
 
     if st.button("Install / Update AI Dependencies", disabled=bool(running_job)):
-        run_script("install_dependencies.py", config.get("selected_folder", ""))
+        run_script("install_dependencies.py", config.get("selected_folder", "") or str(APP_DIR))
 
-    dependency_jobs = [
-        j for j in latest_job_files()
-        if j.name.startswith("install_dependencies_")
-    ]
-
-    if dependency_jobs:
-        dep_job_file = dependency_jobs[0]
-        dep_job = read_job(dep_job_file)
-
-        if dep_job:
-            st.write("Latest dependency install:")
-
-            percent = int(dep_job.get("percent", 0))
-            st.progress(percent / 100)
-
-            st.write(
-                f"Status: **{dep_job.get('status')}** | "
-                f"{dep_job.get('processed', 0)} / {dep_job.get('total', 0)} | "
-                f"{percent}%"
-            )
-
-            current = dep_job.get("current")
-            if current:
-                st.caption(current)
-
-            col_dep1, col_dep2 = st.columns([1, 4])
-
-            with col_dep1:
-                if dep_job.get("status") == "running":
-                    if st.button("Stop Install"):
-                        stop_job(dep_job_file)
-                        st.warning("Stop requested.")
-
-            with col_dep2:
-                if st.button("Refresh Install Status"):
-                    st.rerun()
-
-            log_file = dep_job.get("log_file")
-            if log_file:
-                st.caption(f"Log: {Path(log_file).name}")
-    else:
-        st.info("No dependency install has run yet.")
+    render_dependency_install_status()
 
     st.subheader("System Check")
 

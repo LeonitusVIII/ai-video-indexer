@@ -1,112 +1,92 @@
 import argparse
-
 import datetime
-
 import json
-
 import sqlite3
-
 import sys
-
 from pathlib import Path
-
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-
-from job_utils import find_videos, read_status, should_stop, write_status
-
-
+from job_utils import (
+    compute_file_fingerprint,
+    ensure_video_thumbnail,
+    find_videos,
+    get_video_duration,
+    read_status,
+    should_stop,
+    write_status,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-
 if str(SCRIPT_DIR.parent) not in sys.path:
-
     sys.path.insert(0, str(SCRIPT_DIR.parent))
 
+from app_db import prune_missing_videos, sync_sidecar_flags, update_video_scan_meta
 
 
-from app_db import prune_missing_videos, sync_sidecar_flags
-
-
-
-
-
-def upsert_video(db, video_path):
-
+def upsert_video(db, video_path, *, scan_meta=True):
     stat = video_path.stat()
-
-
+    duration_seconds = None
+    file_fingerprint = None
+    if scan_meta:
+        try:
+            duration_seconds = round(get_video_duration(video_path), 3)
+        except Exception:
+            duration_seconds = None
+        try:
+            file_fingerprint = compute_file_fingerprint(video_path, stat.st_size)
+        except Exception:
+            file_fingerprint = None
+        try:
+            ensure_video_thumbnail(video_path, duration_seconds)
+        except Exception:
+            pass
 
     con = sqlite3.connect(db)
-
     cur = con.cursor()
-
-
-
     cur.execute("""
-
         INSERT INTO videos (
-
             path,
-
             filename,
-
             folder,
-
             extension,
-
             size_bytes,
-
             modified_time,
-
-            scanned_at
-
+            scanned_at,
+            duration_seconds,
+            file_fingerprint
         )
-
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
-
             filename=excluded.filename,
-
             folder=excluded.folder,
-
             extension=excluded.extension,
-
             size_bytes=excluded.size_bytes,
-
             modified_time=excluded.modified_time,
-
-            scanned_at=excluded.scanned_at
-
+            scanned_at=excluded.scanned_at,
+            duration_seconds=COALESCE(excluded.duration_seconds, videos.duration_seconds),
+            file_fingerprint=COALESCE(excluded.file_fingerprint, videos.file_fingerprint)
     """, (
-
         str(video_path),
-
         video_path.name,
-
         str(video_path.parent),
-
         video_path.suffix.lower(),
-
         stat.st_size,
-
         datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-
-        datetime.datetime.now().isoformat(timespec="seconds")
-
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        duration_seconds,
+        file_fingerprint,
     ))
-
-
-
     con.commit()
-
     con.close()
-
     sync_sidecar_flags(db, video_path)
+    if duration_seconds is not None or file_fingerprint is not None:
+        update_video_scan_meta(
+            db,
+            video_path,
+            duration_seconds=duration_seconds,
+            file_fingerprint=file_fingerprint,
+        )
 
 
 

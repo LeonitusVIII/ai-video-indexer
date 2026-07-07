@@ -138,17 +138,17 @@ Only one background job runs at a time (scan, pipeline, or install).
 Live job progress, system stats, and library summary.
 
 **Library**  
-Add/remove folders, browse scanned files, and see per-video pipeline status (✓ · ↻ ✗).
+Add/remove folders, browse scanned files, see per-video pipeline status (✓ · ↻ ✗), thumbnails, detected language, and person tags. Select one or more files and run the pipeline on just those videos.
 
 **Run Jobs**  
-Scan, processing settings, pipeline steps, and quick actions (*Index missing only*, *Refresh stale*, etc.).
+Scan, processing settings, pipeline steps, pick specific file(s) in a folder, and quick actions (*Index missing only*, *Refresh stale*, etc.).
             """
         )
     with col2:
         st.markdown(
             """
 **Search**  
-Semantic + keyword search with optional filters (folder, date, size, extension).
+Semantic + keyword search with optional filters (folder, date, size, extension). Use **Search debug log** after a query to see index stats, Qdrant hits, and why results were filtered out. Details are also saved to `logs/search.log`.
 
 **Tools/System**  
 Install dependencies, system check, Discord notifications, reset search index.
@@ -165,9 +165,9 @@ View processing logs for troubleshooting.
 |------|---------|
 | **Scan library** | Finds video files and updates the SQLite catalog. Removes catalog entries for files deleted from disk under the scanned folder. |
 | **Normalize** | Remuxes legacy formats (`.mov`, `.vob`, `.avi`, …) to `.mkv` without re-encoding. |
-| **Transcribe** | Whisper speech-to-text with timestamps (sidecar `.transcript.json` next to each video). |
+| **Transcribe** | Whisper speech-to-text with timestamps (sidecar `.transcript.json` next to each video). Language is auto-detected per file. |
 | **Vision** | Sampled frame descriptions via a local Qwen vision model (`.vision.json`). |
-| **Metadata** | Merges transcript + vision into searchable chunks (`.metadata.json`). |
+| **Metadata** | Merges transcript + vision into searchable chunks (`.metadata.json`). Extracts optional **person tags** from descriptions for search. |
 | **Index search DB** | Embeds chunks into local Qdrant for the Search tab. |
         """
     )
@@ -198,6 +198,7 @@ Processing writes JSON/text files **next to each video** on your share (same fol
 - `.transcript.json`, `.transcript.txt`, `.whisper.srt`
 - `.vision.json`
 - `.metadata.json`
+- `.thumbnail.jpg` (preview frame, created during scan)
 
 The app database lives under `data/video_indexer.db`; search vectors live under `data/qdrant/`.
         """
@@ -220,6 +221,24 @@ Confirm **Index search DB** ran, check Dashboard *Indexed* count, or **Reset sea
 
 **Normalize moved files**  
 After normalize, re-run **Index search DB** for affected videos so search paths stay correct.
+
+**One video only**  
+Library → select file(s) → **Run pipeline on selected**, or Run Jobs → *Or choose specific file(s)*.
+
+**Find duplicates**  
+Library and Tools/System show groups matched by fingerprint or size+duration. Rescan folders to refresh fingerprints.
+
+**Export search hits**  
+Search tab → **Export CSV** or **Export Markdown** after running a query.
+        """
+    )
+
+    st.subheader("Dual GPU systems")
+    st.markdown(
+        """
+The app uses **one GPU at a time** for AI steps (typically `cuda:0` — your primary NVIDIA card). Whisper and the vision model share that device; they do not automatically split across two GPUs.
+
+With two GPUs you can still benefit manually: run Whisper on GPU 0 and vision on GPU 1 only if you set `CUDA_VISIBLE_DEVICES` before launching separate jobs — not supported out of the box today. CPU fallback works when GPU memory is tight.
         """
     )
 
