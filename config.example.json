@@ -30,5 +30,29 @@
     "notify_on_complete": true,
     "notify_on_failed": true,
     "notify_on_stopped": false
+  },
+  "schedule": {
+    "enabled": false,
+    "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
+    "start_time": "22:00",
+    "stop_time": "06:00",
+    "scope": "all_folders",
+    "auto_resume": true
+  },
+  "transcode": {
+    "quality_preset": "balanced",
+    "crf": 0,
+    "rate_control": "crf",
+    "target_bitrate_kbps": 8000,
+    "target_filesize_mb": 500,
+    "encoder": "auto",
+    "x265_preset": "medium",
+    "audio_mode": "copy",
+    "output_mode": "suffix",
+    "output_extension": ".mp4",
+    "skip_hevc_source": true,
+    "max_height": 0,
+    "overwrite": false,
+    "min_free_gb": 5
   }
 }

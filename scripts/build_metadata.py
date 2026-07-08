@@ -15,16 +15,17 @@ from job_utils import (
     read_status,
     should_stop,
     transcript_json_path,
-    update_video_flag,
     vision_json_path,
     write_status,
 )
 from person_tags import extract_people_tags
+from catalog_db import CatalogWriter, update_video_metadata
 from pipeline_utils import (
     add_pipeline_control_args,
     clear_step_failure,
     filter_videos_for_step,
     get_video_row,
+    load_video_rows_map,
     load_video_allowlist,
     record_step_failure,
     skip_mode_from_args,
@@ -181,6 +182,7 @@ def main():
         allowlist,
     )
     total = len(videos)
+    row_cache = load_video_rows_map(args.db, videos)
 
     status.update({
         "total": total,
@@ -189,62 +191,58 @@ def main():
     write_status(status_file, status)
     print(f"Found {total} video files.", flush=True)
 
-    for i, video in enumerate(videos, start=1):
-        if should_stop(status_file):
-            status.update({
-                "status": "stopped",
-                "current": "Stopped by user.",
-                "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            })
-            write_status(status_file, status)
-            print("Stopped by user.", flush=True)
-            sys.exit(0)
+    with CatalogWriter(args.db) as writer:
+        for i, video in enumerate(videos, start=1):
+            if should_stop(status_file):
+                status.update({
+                    "status": "stopped",
+                    "current": "Stopped by user.",
+                    "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                })
+                write_status(status_file, status)
+                print("Stopped by user.", flush=True)
+                sys.exit(0)
 
-        output_file = metadata_json_path(video)
-        row = get_video_row(args.db, video)
+            output_file = metadata_json_path(video)
+            row = get_video_row(args.db, video, row_cache=row_cache)
 
-        if output_file.exists() and not overwrite and step_status(row, "metadata") == "complete":
-            print(f"Skipping existing metadata: {video}", flush=True)
-            update_video_flag(args.db, video, "has_metadata")
-        else:
+            if output_file.exists() and not overwrite and step_status(row, "metadata") == "complete":
+                print(f"Skipping existing metadata: {video}", flush=True)
+                update_video_metadata(writer, video)
+            else:
+                status.update({
+                    "current": f"Building metadata: {video}",
+                    "processed": i - 1,
+                    "total": total,
+                    "percent": int(((i - 1) / total) * 100) if total else 100,
+                })
+                write_status(status_file, status)
+                print(f"\nBuilding metadata: {video}", flush=True)
+
+                try:
+                    metadata = build_metadata_for_video(video, interval_seconds)
+                    output_file.write_text(
+                        json.dumps(metadata, indent=2), encoding="utf-8"
+                    )
+                    update_video_metadata(writer, video, metadata.get("people_tags"))
+                    clear_step_failure(video, "metadata")
+                    print(
+                        f"Created {len(metadata['search_chunks'])} search chunks",
+                        flush=True,
+                    )
+                except Exception as e:
+                    record_step_failure(video, "metadata", str(e))
+                    print(f"FAILED: {video}", flush=True)
+                    print(str(e), flush=True)
+
+            percent = int((i / total) * 100) if total else 100
             status.update({
-                "current": f"Building metadata: {video}",
-                "processed": i - 1,
+                "processed": i,
                 "total": total,
-                "percent": int(((i - 1) / total) * 100) if total else 100,
+                "percent": percent,
+                "current": str(video),
             })
             write_status(status_file, status)
-            print(f"\nBuilding metadata: {video}", flush=True)
-
-            try:
-                metadata = build_metadata_for_video(video, interval_seconds)
-                output_file.write_text(
-                    json.dumps(metadata, indent=2), encoding="utf-8"
-                )
-                update_video_flag(args.db, video, "has_metadata")
-                if metadata.get("people_tags"):
-                    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-                    from app_db import update_video_people_tags
-
-                    update_video_people_tags(args.db, video, metadata["people_tags"])
-                clear_step_failure(video, "metadata")
-                print(
-                    f"Created {len(metadata['search_chunks'])} search chunks",
-                    flush=True,
-                )
-            except Exception as e:
-                record_step_failure(video, "metadata", str(e))
-                print(f"FAILED: {video}", flush=True)
-                print(str(e), flush=True)
-
-        percent = int((i / total) * 100) if total else 100
-        status.update({
-            "processed": i,
-            "total": total,
-            "percent": percent,
-            "current": str(video),
-        })
-        write_status(status_file, status)
 
     status.update({
         "status": "complete",
@@ -257,4 +255,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import run_script_main, status_file_from_argv
+
+    run_script_main(main, status_file_from_argv())

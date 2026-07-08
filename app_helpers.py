@@ -321,23 +321,32 @@ def open_video_at_timestamp(video_path, start_seconds):
     ]
     for vlc in vlc_candidates:
         if vlc and Path(vlc).exists():
-            subprocess.Popen(
-                [vlc, str(path), f"--start-time={start_seconds}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            try:
+                subprocess.Popen(
+                    [vlc, str(path), f"--start-time={start_seconds}"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                return False, f"Could not launch VLC: {exc}"
             return True, f"Opened in VLC at {start_seconds}s"
 
     ffplay = shutil.which("ffplay")
     if ffplay:
-        subprocess.Popen(
-            [ffplay, "-ss", str(start_seconds), "-autoexit", str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                [ffplay, "-ss", str(start_seconds), "-autoexit", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return False, f"Could not launch ffplay: {exc}"
         return True, f"Opened in ffplay at {start_seconds}s"
 
-    os.startfile(str(path))
+    try:
+        os.startfile(str(path))
+    except OSError as exc:
+        return False, f"Could not open video: {exc}"
     return True, "Opened video (could not jump to timestamp — install VLC for timed playback)"
 
 

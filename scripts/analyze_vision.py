@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from catalog_db import CatalogWriter, update_video_flag as catalog_update_flag
 from job_utils import (
     add_processing_args,
     compute_frame_times,
@@ -16,7 +17,6 @@ from job_utils import (
     overwrite_from_args,
     read_status,
     should_stop,
-    update_video_flag,
     use_gpu_from_args,
     vision_json_path,
     vision_model_config_from_args,
@@ -29,6 +29,7 @@ from pipeline_utils import (
     clear_step_failure,
     filter_videos_for_step,
     get_video_row,
+    load_video_rows_map,
     load_video_allowlist,
     record_step_failure,
     skip_mode_from_args,
@@ -320,6 +321,7 @@ def main():
         allowlist,
     )
     total = len(videos)
+    row_cache = load_video_rows_map(args.db, videos)
 
     status.update({
         "total": total,
@@ -355,93 +357,94 @@ def main():
 
     print(f"Vision model ready on {device}", flush=True)
 
-    for i, video in enumerate(videos, start=1):
-        if should_stop(status_file):
-            status.update({
-                "status": "stopped",
-                "current": "Stopped by user.",
-                "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            })
-            write_status(status_file, status)
-            print("Stopped by user.", flush=True)
-            sys.exit(0)
+    with CatalogWriter(args.db) as writer:
+        for i, video in enumerate(videos, start=1):
+            if should_stop(status_file):
+                status.update({
+                    "status": "stopped",
+                    "current": "Stopped by user.",
+                    "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                })
+                write_status(status_file, status)
+                print("Stopped by user.", flush=True)
+                sys.exit(0)
 
-        output_file = vision_json_path(video)
-        row = get_video_row(args.db, video)
+            output_file = vision_json_path(video)
+            row = get_video_row(args.db, video, row_cache=row_cache)
 
-        if (
-            output_file.exists()
-            and not overwrite
-            and vision_output_complete(output_file)
-            and step_status(row, "vision") == "complete"
-        ):
-            print(f"Skipping existing vision file: {video}", flush=True)
-            update_video_flag(args.db, video, "has_vision")
+            if (
+                output_file.exists()
+                and not overwrite
+                and vision_output_complete(output_file)
+                and step_status(row, "vision") == "complete"
+            ):
+                print(f"Skipping existing vision file: {video}", flush=True)
+                catalog_update_flag(writer, video, "has_vision")
+                clear_item_progress(status, status_file)
+            else:
+                resume_data = None
+                if output_file.exists() and not overwrite:
+                    resume_data = load_resume_vision(
+                        output_file,
+                        model_id=model_id,
+                        interval_seconds=interval_seconds,
+                        min_frames=min_frames,
+                    )
+                    if resume_data:
+                        print(f"Resuming partial vision output: {video}", flush=True)
+                    elif output_file.exists():
+                        try:
+                            partial = json.loads(output_file.read_text(encoding="utf-8"))
+                        except Exception:
+                            partial = {}
+                        if partial.get("frames") and partial.get("status") != "complete":
+                            print(
+                                f"Partial vision output uses different settings; restarting: {video}",
+                                flush=True,
+                            )
+
+                status.update({
+                    "current": f"Analyzing vision: {video}",
+                    "processed": i - 1,
+                    "total": total,
+                    "percent": int(((i - 1) / total) * 100) if total else 100,
+                })
+                clear_item_progress(status, status_file)
+                write_status(status_file, status)
+                print(f"\nAnalyzing: {video}", flush=True)
+
+                try:
+                    result = analyze_video(
+                        video,
+                        model,
+                        processor,
+                        process_vision_info,
+                        interval_seconds,
+                        min_frames,
+                        model_id,
+                        output_file,
+                        resume_data=resume_data,
+                        status_file=status_file,
+                        status=status,
+                    )
+                    write_vision_output(output_file, result)
+                    catalog_update_flag(writer, video, "has_vision")
+                    clear_step_failure(video, "vision")
+                    print(f"Completed: {video}", flush=True)
+                except Exception as e:
+                    record_step_failure(video, "vision", str(e))
+                    print(f"FAILED: {video}", flush=True)
+                    print(str(e), flush=True)
+
+            percent = int((i / total) * 100) if total else 100
             clear_item_progress(status, status_file)
-        else:
-            resume_data = None
-            if output_file.exists() and not overwrite:
-                resume_data = load_resume_vision(
-                    output_file,
-                    model_id=model_id,
-                    interval_seconds=interval_seconds,
-                    min_frames=min_frames,
-                )
-                if resume_data:
-                    print(f"Resuming partial vision output: {video}", flush=True)
-                elif output_file.exists():
-                    try:
-                        partial = json.loads(output_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        partial = {}
-                    if partial.get("frames") and partial.get("status") != "complete":
-                        print(
-                            f"Partial vision output uses different settings; restarting: {video}",
-                            flush=True,
-                        )
-
             status.update({
-                "current": f"Analyzing vision: {video}",
-                "processed": i - 1,
+                "processed": i,
                 "total": total,
-                "percent": int(((i - 1) / total) * 100) if total else 100,
+                "percent": percent,
+                "current": str(video),
             })
-            clear_item_progress(status, status_file)
             write_status(status_file, status)
-            print(f"\nAnalyzing: {video}", flush=True)
-
-            try:
-                result = analyze_video(
-                    video,
-                    model,
-                    processor,
-                    process_vision_info,
-                    interval_seconds,
-                    min_frames,
-                    model_id,
-                    output_file,
-                    resume_data=resume_data,
-                    status_file=status_file,
-                    status=status,
-                )
-                write_vision_output(output_file, result)
-                update_video_flag(args.db, video, "has_vision")
-                clear_step_failure(video, "vision")
-                print(f"Completed: {video}", flush=True)
-            except Exception as e:
-                record_step_failure(video, "vision", str(e))
-                print(f"FAILED: {video}", flush=True)
-                print(str(e), flush=True)
-
-        percent = int((i / total) * 100) if total else 100
-        clear_item_progress(status, status_file)
-        status.update({
-            "processed": i,
-            "total": total,
-            "percent": percent,
-            "current": str(video),
-        })
-        write_status(status_file, status)
 
     status.update({
         "status": "complete",
@@ -454,4 +457,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import run_script_main, status_file_from_argv
+
+    run_script_main(main, status_file_from_argv())

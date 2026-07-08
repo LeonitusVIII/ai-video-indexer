@@ -17,11 +17,13 @@ from job_utils import (
     use_gpu_from_args,
     write_status,
 )
+from catalog_db import CatalogWriter, update_video_transcript
 from pipeline_utils import (
     add_pipeline_control_args,
     clear_step_failure,
     filter_videos_for_step,
     get_video_row,
+    load_video_rows_map,
     load_video_allowlist,
     record_step_failure,
     skip_mode_from_args,
@@ -40,7 +42,10 @@ def load_transcript_language(json_file):
     return data.get("language")
 
 
-def update_video_transcript_status(db, video_path, language=None):
+def update_video_transcript_status(db, video_path, language=None, writer=None):
+    if writer is not None:
+        update_video_transcript(writer, video_path, language)
+        return
     if language:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from app_db import update_video_transcript_language
@@ -95,6 +100,7 @@ def main():
         allowlist,
     )
     total = len(videos)
+    row_cache = load_video_rows_map(args.db, videos)
 
     status.update({
         "total": total,
@@ -138,113 +144,114 @@ def main():
         print(f"FAILED: Could not load Whisper model on {device}: {e}", flush=True)
         sys.exit(1)
 
-    for i, video in enumerate(videos, start=1):
-        current_status = read_status(status_file)
+    with CatalogWriter(args.db) as writer:
+        for i, video in enumerate(videos, start=1):
+            current_status = read_status(status_file)
 
-        if current_status.get("stop_requested"):
+            if current_status.get("stop_requested"):
+                status.update({
+                    "status": "stopped",
+                    "current": "Stopped by user.",
+                    "finished_at": datetime.datetime.now().isoformat(timespec="seconds")
+                })
+                write_status(status_file, status)
+                print("Stopped by user.", flush=True)
+                sys.exit(0)
+
+            txt_file = video.with_suffix(video.suffix + ".transcript.txt")
+            srt_file = video.with_suffix(video.suffix + ".whisper.srt")
+            json_file = video.with_suffix(video.suffix + ".transcript.json")
+            row = get_video_row(args.db, video, row_cache=row_cache)
+
+            if (
+                txt_file.exists()
+                and srt_file.exists()
+                and json_file.exists()
+                and not overwrite
+                and step_status(row, "transcribe") == "complete"
+            ):
+                print(f"Skipping existing transcript: {video}", flush=True)
+                language = load_transcript_language(json_file)
+                update_video_transcript_status(args.db, video, language, writer=writer)
+            else:
+                status.update({
+                    "current": f"Transcribing: {video}",
+                    "processed": i - 1,
+                    "total": total,
+                    "percent": int(((i - 1) / total) * 100) if total else 100
+                })
+                write_status(status_file, status)
+
+                print(f"Transcribing: {video}", flush=True)
+
+                try:
+                    segments, info = model.transcribe(
+                        str(video),
+                        beam_size=5,
+                        vad_filter=True,
+                        word_timestamps=True
+                    )
+
+                    transcript_segments = []
+                    txt_lines = []
+                    srt_blocks = []
+
+                    for idx, segment in enumerate(segments, start=1):
+                        text = segment.text.strip()
+
+                        transcript_segments.append({
+                            "id": idx,
+                            "start": segment.start,
+                            "end": segment.end,
+                            "text": text
+                        })
+
+                        txt_lines.append(
+                            f"[{segment.start:.2f} - {segment.end:.2f}] {text}"
+                        )
+
+                        def srt_time(seconds):
+                            hours = int(seconds // 3600)
+                            minutes = int((seconds % 3600) // 60)
+                            secs = int(seconds % 60)
+                            millis = int((seconds - int(seconds)) * 1000)
+                            return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+                        srt_blocks.append(
+                            f"{idx}\n{srt_time(segment.start)} --> {srt_time(segment.end)}\n{text}\n"
+                        )
+
+                    txt_file.write_text("\n".join(txt_lines), encoding="utf-8")
+                    srt_file.write_text("\n".join(srt_blocks), encoding="utf-8")
+
+                    json_file.write_text(
+                        json.dumps({
+                            "video": str(video),
+                            "language": info.language,
+                            "language_probability": info.language_probability,
+                            "segments": transcript_segments
+                        }, indent=2),
+                        encoding="utf-8"
+                    )
+
+                    update_video_transcript_status(args.db, video, info.language, writer=writer)
+                    clear_step_failure(video, "transcribe")
+
+                    print(f"Completed: {video} (language: {info.language})", flush=True)
+
+                except Exception as e:
+                    record_step_failure(video, "transcribe", str(e))
+                    print(f"FAILED: {video}", flush=True)
+                    print(str(e), flush=True)
+
+            percent = int((i / total) * 100) if total else 100
             status.update({
-                "status": "stopped",
-                "current": "Stopped by user.",
-                "finished_at": datetime.datetime.now().isoformat(timespec="seconds")
-            })
-            write_status(status_file, status)
-            print("Stopped by user.", flush=True)
-            sys.exit(0)
-
-        txt_file = video.with_suffix(video.suffix + ".transcript.txt")
-        srt_file = video.with_suffix(video.suffix + ".whisper.srt")
-        json_file = video.with_suffix(video.suffix + ".transcript.json")
-        row = get_video_row(args.db, video)
-
-        if (
-            txt_file.exists()
-            and srt_file.exists()
-            and json_file.exists()
-            and not overwrite
-            and step_status(row, "transcribe") == "complete"
-        ):
-            print(f"Skipping existing transcript: {video}", flush=True)
-            language = load_transcript_language(json_file)
-            update_video_transcript_status(args.db, video, language)
-        else:
-            status.update({
-                "current": f"Transcribing: {video}",
-                "processed": i - 1,
+                "processed": i,
                 "total": total,
-                "percent": int(((i - 1) / total) * 100) if total else 100
+                "percent": percent,
+                "current": str(video)
             })
             write_status(status_file, status)
-
-            print(f"Transcribing: {video}", flush=True)
-
-            try:
-                segments, info = model.transcribe(
-                    str(video),
-                    beam_size=5,
-                    vad_filter=True,
-                    word_timestamps=True
-                )
-
-                transcript_segments = []
-                txt_lines = []
-                srt_blocks = []
-
-                for idx, segment in enumerate(segments, start=1):
-                    text = segment.text.strip()
-
-                    transcript_segments.append({
-                        "id": idx,
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": text
-                    })
-
-                    txt_lines.append(
-                        f"[{segment.start:.2f} - {segment.end:.2f}] {text}"
-                    )
-
-                    def srt_time(seconds):
-                        hours = int(seconds // 3600)
-                        minutes = int((seconds % 3600) // 60)
-                        secs = int(seconds % 60)
-                        millis = int((seconds - int(seconds)) * 1000)
-                        return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
-
-                    srt_blocks.append(
-                        f"{idx}\n{srt_time(segment.start)} --> {srt_time(segment.end)}\n{text}\n"
-                    )
-
-                txt_file.write_text("\n".join(txt_lines), encoding="utf-8")
-                srt_file.write_text("\n".join(srt_blocks), encoding="utf-8")
-
-                json_file.write_text(
-                    json.dumps({
-                        "video": str(video),
-                        "language": info.language,
-                        "language_probability": info.language_probability,
-                        "segments": transcript_segments
-                    }, indent=2),
-                    encoding="utf-8"
-                )
-
-                update_video_transcript_status(args.db, video, info.language)
-                clear_step_failure(video, "transcribe")
-
-                print(f"Completed: {video} (language: {info.language})", flush=True)
-
-            except Exception as e:
-                record_step_failure(video, "transcribe", str(e))
-                print(f"FAILED: {video}", flush=True)
-                print(str(e), flush=True)
-
-        percent = int((i / total) * 100) if total else 100
-        status.update({
-            "processed": i,
-            "total": total,
-            "percent": percent,
-            "current": str(video)
-        })
-        write_status(status_file, status)
 
     status.update({
         "status": "complete",
@@ -258,4 +265,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import run_script_main, status_file_from_argv
+
+    run_script_main(main, status_file_from_argv())

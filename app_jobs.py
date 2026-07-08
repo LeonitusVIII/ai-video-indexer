@@ -1,9 +1,16 @@
 """Shared UI components for job monitoring."""
+import sys
 from pathlib import Path
 
 import streamlit as st
 
 from app_helpers import compute_job_elapsed
+
+SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from pipeline_utils import STEP_LABELS, clear_all_failures, load_failures
 
 PIPELINE_STEP_KEYS = (
     "scan",
@@ -16,10 +23,52 @@ PIPELINE_STEP_KEYS = (
 
 STANDALONE_JOB_LABELS = {
     "scan_library.py": "Scan library",
+    "transcode_hevc.py": "HEVC transcode",
     "install_dependencies.py": "Install dependencies",
     "install_model_deps.py": "Install model dependencies",
     "system_check.py": "System check",
 }
+
+
+def render_job_outcome_alert(job):
+    status = job.get("status", "unknown")
+    current = (job.get("current") or "").strip()
+    if status == "failed":
+        st.error(current or "Job failed. Check the log below for details.")
+    elif status == "complete_with_failures":
+        st.warning(
+            current or "Job finished with per-video failures. See Tools/System → Pipeline failures."
+        )
+    elif status == "stopped":
+        st.info(current or "Job was stopped.")
+
+
+def render_pipeline_failures_panel():
+    failures = load_failures()
+    if not failures:
+        return
+
+    total = sum(len(steps) for steps in failures.values())
+    with st.expander(f"Pipeline failures ({total} on {len(failures)} video(s))", expanded=total <= 10):
+        st.caption(
+            "Per-video errors from pipeline, normalize, and transcode jobs. "
+            "Re-run the failed step with **Force** or clear stale entries below."
+        )
+        rows = []
+        for path in sorted(failures):
+            for step_key, message in sorted(failures[path].items()):
+                rows.append({
+                    "Video": Path(path).name,
+                    "Step": STEP_LABELS.get(step_key, step_key),
+                    "Error": message,
+                    "Path": path,
+                })
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+        if st.button("Clear all pipeline failure records", key="clear_all_pipeline_failures"):
+            clear_all_failures()
+            st.success("Pipeline failure records cleared.")
+            st.rerun()
 
 
 def tail_log_file(log_path, max_lines=20):
@@ -202,7 +251,7 @@ def render_job_status_banner(job_files, read_job_fn, stop_job_fn, *, key_prefix=
                 f"**{percent}%** complete · {processed} / {total} {unit} · Elapsed **{elapsed}**"
             )
         with banner_col4:
-            if st.button("Stop", key=f"{key_prefix}banner_stop", use_container_width=True):
+            if st.button("Stop", key=f"{key_prefix}banner_stop", width="stretch"):
                 stop_job_fn(job_file)
                 st.warning("Stop requested.")
 
@@ -257,6 +306,8 @@ def render_job_panel(
 
         render_job_progress_layers(job, job_file, read_job_fn)
 
+        render_job_outcome_alert(job)
+
         percent = int(job.get("percent", 0))
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Status", job.get("status", "unknown"))
@@ -288,6 +339,8 @@ def render_job_panel(
                     disabled=True,
                     key=f"{key_prefix}job_log_tail",
                 )
+            else:
+                st.caption("Log file exists but could not be read or is empty.")
 
         btn_col1, btn_col2 = st.columns([1, 4])
         with btn_col1:

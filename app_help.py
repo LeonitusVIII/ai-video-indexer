@@ -95,7 +95,7 @@ def whisper_model_info_popover():
     with st.popover("Model info"):
         render_whisper_model_reference(compact=True)
         st.caption("Full guide: open the **Help** tab → **Whisper models**.")
-        st.link_button("OpenAI Whisper model list", WHISPER_DOCS_URL, use_container_width=True)
+        st.link_button("OpenAI Whisper model list", WHISPER_DOCS_URL, width="stretch")
 
 
 def vision_model_info_popover():
@@ -105,7 +105,7 @@ def vision_model_info_popover():
         st.link_button(
             "Qwen2.5-VL 3B on Hugging Face",
             VISION_MODEL_LINKS["qwen2.5-vl-3b"],
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -230,6 +230,15 @@ Library and Tools/System show groups matched by fingerprint or size+duration. Re
 
 **Export search hits**  
 Search tab → **Export CSV** or **Export Markdown** after running a query.
+
+**Overnight / scheduled runs**  
+Tools/System → **Overnight / scheduled runs**: pick days, start/stop times, enable schedule. The pipeline stops at stop time (resume saved) and continues next scheduled night. Run `register_schedule_task.bat` so Windows checks every 5 minutes when the app is closed. Manual Run Jobs are never auto-stopped.
+
+**HEVC transcode (standalone)**  
+Run Jobs → **HEVC transcode**: pick CRF quality, **target bitrate**, or **target file size** per video. Use **suffix** to keep originals alongside smaller `.hevc` copies, or **replace** to swap files and move originals to `_OLD_FILES_REVIEW`. Disk space is checked before the job runs.
+
+**Disk space**  
+The Library tab shows volume free/total for the selected folder path (works on local drives and many `\\server\share` UNC paths). HEVC transcode estimates workspace needs and blocks the job if space is too tight.
         """
     )
 

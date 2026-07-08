@@ -23,6 +23,7 @@ STEP_LABELS = {
     "vision": "Vision",
     "metadata": "Metadata",
     "index": "Indexed",
+    "transcode": "HEVC transcode",
 }
 
 STEP_DB_FLAG = {
@@ -139,14 +140,51 @@ def clear_all_failures():
         FAILURES_FILE.unlink()
 
 
-def get_video_row(db, video_path):
+def get_video_row(db, video_path, row_cache=None):
+    path = str(video_path)
+    if row_cache is not None:
+        return row_cache.get(path, {"path": path})
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
-    cur.execute("SELECT * FROM videos WHERE path = ?", (str(video_path),))
+    cur.execute("SELECT * FROM videos WHERE path = ?", (path,))
     row = cur.fetchone()
     con.close()
-    return dict(row) if row else {"path": str(video_path)}
+    return dict(row) if row else {"path": path}
+
+
+def load_video_rows_map(db, video_paths):
+    paths = [str(p) for p in video_paths]
+    if not paths:
+        return {}
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    rows = {}
+    chunk_size = 400
+    for offset in range(0, len(paths), chunk_size):
+        chunk = paths[offset:offset + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        cur.execute(
+            f"SELECT * FROM videos WHERE path IN ({placeholders})",
+            chunk,
+        )
+        for row in cur.fetchall():
+            item = dict(row)
+            rows[item["path"]] = item
+    con.close()
+    return rows
+
+
+def load_folder_video_rows(db, folder):
+    prefix = str(folder).rstrip("\\/") + "%"
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("SELECT * FROM videos WHERE path LIKE ?", (prefix,))
+    rows = {dict(row)["path"]: dict(row) for row in cur.fetchall()}
+    con.close()
+    return rows
 
 
 def normalize_needed(video_path):
@@ -156,6 +194,31 @@ def normalize_needed(video_path):
     if path.name.upper().startswith("VTS_") and path.suffix.lower() == ".vob":
         return False
     return not path.with_suffix(".mkv").exists()
+
+
+def should_process_video(db, video_path, step_key, skip_mode, overwrite, row_cache=None):
+    if overwrite:
+        return True
+
+    row = get_video_row(db, video_path, row_cache=row_cache)
+
+    if skip_mode == "all":
+        if step_key == "normalize":
+            return normalize_needed(video_path)
+        return True
+
+    status = step_status(row, step_key)
+
+    if skip_mode == "missing_only":
+        return status in {"missing", "failed"}
+
+    if skip_mode == "stale_only":
+        return status in {"stale", "missing", "failed"}
+
+    if skip_mode == "incomplete_only":
+        return status != "complete"
+
+    return True
 
 
 def vision_output_complete(sidecar_path):
@@ -249,38 +312,15 @@ def step_status(video_row, step_key):
     return "missing"
 
 
-def should_process_video(db, video_path, step_key, skip_mode, overwrite):
-    if overwrite:
-        return True
-
-    row = get_video_row(db, video_path)
-
-    if skip_mode == "all":
-        if step_key == "normalize":
-            return normalize_needed(video_path)
-        return True
-
-    status = step_status(row, step_key)
-
-    if skip_mode == "missing_only":
-        return status in {"missing", "failed"}
-
-    if skip_mode == "stale_only":
-        return status in {"stale", "missing", "failed"}
-
-    if skip_mode == "incomplete_only":
-        return status != "complete"
-
-    return True
-
-
-def filter_videos_for_step(videos, db, step_key, skip_mode, overwrite, allowlist=None):
+def filter_videos_for_step(videos, db, step_key, skip_mode, overwrite, allowlist=None, row_cache=None):
+    if row_cache is None:
+        row_cache = load_video_rows_map(db, [str(v) for v in videos])
     selected = []
     for video in videos:
         path = str(video)
         if allowlist is not None and path not in allowlist:
             continue
-        if should_process_video(db, path, step_key, skip_mode, overwrite):
+        if should_process_video(db, path, step_key, skip_mode, overwrite, row_cache=row_cache):
             selected.append(video)
     return selected
 

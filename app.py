@@ -8,6 +8,7 @@ import sqlite3
 import os
 import signal
 import sys
+import shutil
 import pandas as pd
 import psutil
 from search_engine import (
@@ -47,16 +48,44 @@ from app_helpers import (
     search_results_to_csv,
     search_results_to_markdown,
 )
-from app_jobs import render_job_panel, render_job_status_banner, tail_log_file
+from disk_space import (
+    format_bytes,
+    format_disk_line,
+    get_disk_space,
+    estimate_transcode_bytes,
+    transcode_space_check,
+)
+from app_jobs import (
+    render_job_panel,
+    render_job_status_banner,
+    render_pipeline_failures_panel,
+    tail_log_file,
+)
 from app_wizard import render_setup_wizard, environment_ready
 from notifications import send_discord_webhook
 from pipeline_estimate import render_pipeline_estimator_ui
 
 SCRIPT_DIR_IMPORT = Path(__file__).parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR_IMPORT))
-from pipeline_utils import filter_videos_by_status, video_has_incomplete_steps, STEP_LABELS
+from pipeline_utils import (
+    clear_all_failures,
+    filter_videos_by_status,
+    load_failures,
+    video_has_incomplete_steps,
+    STEP_LABELS,
+)
 from job_utils import DEFAULT_VISION_MODEL_KEY, VISION_MODEL_OPTIONS
 from model_deps import missing_vision_packages
+from schedule_manager import (
+    DEFAULT_SCHEDULE,
+    WEEKDAY_LABELS,
+    merge_schedule_defaults,
+    schedule_needs_background_poll,
+    schedule_status,
+    tick_schedule,
+    register_windows_scheduled_task,
+    remove_windows_scheduled_task,
+)
 
 APP_DIR = Path(__file__).parent
 CONFIG_FILE = APP_DIR / "config.json"
@@ -68,6 +97,8 @@ DB_FILE = DATA_DIR / "video_indexer.db"
 RESUME_FILE = DATA_DIR / "pipeline_resume.json"
 PIPELINE_FOLDERS_FILE = DATA_DIR / "pipeline_folders.json"
 PIPELINE_VIDEO_FILTER = DATA_DIR / "pipeline_video_filter.json"
+PYTHON_EXE = APP_DIR / "venv" / "Scripts" / "python.exe"
+CONFIG_LOAD_WARNING = None
 SKIP_MODE_OPTIONS = {
     "all": "All videos (respect overwrite settings)",
     "missing_only": "Missing outputs only (recommended)",
@@ -90,6 +121,43 @@ SEARCH_EXAMPLE_QUERIES = (
     "at the beach",
     "grandpa talking",
 )
+DEFAULT_TRANSCODE = {
+    "quality_preset": "balanced",
+    "crf": 0,
+    "rate_control": "crf",
+    "target_bitrate_kbps": 8000,
+    "target_filesize_mb": 500,
+    "encoder": "auto",
+    "x265_preset": "medium",
+    "audio_mode": "copy",
+    "output_mode": "suffix",
+    "output_extension": ".mp4",
+    "skip_hevc_source": True,
+    "max_height": 0,
+    "overwrite": False,
+    "min_free_gb": 5,
+}
+
+TRANSCODE_RATE_CONTROL_OPTIONS = {
+    "crf": "CRF quality (preset or custom — visually tuned)",
+    "bitrate": "Target video bitrate (kbps)",
+    "filesize": "Target output file size (MB per video)",
+}
+
+TRANSCODE_QUALITY_PRESETS = {
+    "archival": "Archival — best quality, larger files (CRF ~20)",
+    "balanced": "Balanced — recommended default (CRF ~24)",
+    "compact": "Compact — smaller files (CRF ~28)",
+    "smallest": "Smallest — maximum compression (CRF ~32)",
+}
+
+TRANSCODE_MAX_HEIGHT_OPTIONS = {
+    0: "Keep original resolution",
+    1080: "Max 1080p",
+    720: "Max 720p",
+    480: "Max 480p",
+}
+
 for p in [LOG_DIR, SCRIPT_DIR, DATA_DIR, JOBS_DIR]:
     p.mkdir(exist_ok=True)
 
@@ -125,15 +193,40 @@ DEFAULT_CONFIG = {
         "notify_on_complete": True,
         "notify_on_failed": True,
         "notify_on_stopped": False
-    }
+    },
+    "schedule": {
+        **DEFAULT_SCHEDULE,
+        "days_of_week": list(DEFAULT_SCHEDULE["days_of_week"]),
+    },
+    "transcode": {
+        **DEFAULT_TRANSCODE,
+    },
 }
 
 
 def load_config():
     if CONFIG_FILE.exists():
-        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        try:
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            backup = CONFIG_FILE.with_suffix(".json.bak")
+            try:
+                shutil.copy2(CONFIG_FILE, backup)
+                CONFIG_LOAD_WARNING = (
+                    f"`config.json` could not be read ({exc}). "
+                    f"Using defaults. A backup was saved as `{backup.name}`."
+                )
+            except OSError:
+                CONFIG_LOAD_WARNING = (
+                    f"`config.json` could not be read ({exc}). Using defaults."
+                )
+            globals()["CONFIG_LOAD_WARNING"] = CONFIG_LOAD_WARNING
+            config = json.loads(json.dumps(DEFAULT_CONFIG))
+        else:
+            globals()["CONFIG_LOAD_WARNING"] = None
     else:
-        config = DEFAULT_CONFIG.copy()
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+        globals()["CONFIG_LOAD_WARNING"] = None
 
     if "pipeline" in config:
         config["pipeline"].pop("enhance_audio", None)
@@ -147,11 +240,22 @@ def load_config():
     processing.setdefault("vision_model", DEFAULT_VISION_MODEL_KEY)
     processing.setdefault("step_overwrite", DEFAULT_CONFIG["processing"]["step_overwrite"].copy())
 
+    merge_schedule_defaults(config)
+    transcode = config.setdefault("transcode", {})
+    for key, value in DEFAULT_TRANSCODE.items():
+        transcode.setdefault(key, value)
     return config
 
 
 def save_config(config):
-    CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    try:
+        CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        global CONFIG_LOAD_WARNING
+        CONFIG_LOAD_WARNING = None
+        return True
+    except OSError as exc:
+        st.error(f"Could not save settings to config.json: {exc}")
+        return False
 
 
 def is_pid_running(pid):
@@ -352,6 +456,29 @@ def clear_pipeline_video_filter():
         PIPELINE_VIDEO_FILTER.unlink()
 
 
+def transcode_args(config, video_filter_file=None):
+    t = config.get("transcode", DEFAULT_TRANSCODE)
+    args = [
+        "--quality-preset", t.get("quality_preset", "balanced"),
+        "--crf", str(int(t.get("crf", 0) or 0)),
+        "--rate-control", t.get("rate_control", "crf"),
+        "--target-bitrate-kbps", str(int(t.get("target_bitrate_kbps", 0) or 0)),
+        "--target-filesize-mb", str(int(t.get("target_filesize_mb", 0) or 0)),
+        "--encoder", t.get("encoder", "auto"),
+        "--x265-preset", t.get("x265_preset", "medium"),
+        "--audio-mode", t.get("audio_mode", "copy"),
+        "--output-mode", t.get("output_mode", "suffix"),
+        "--output-extension", t.get("output_extension", ".mp4"),
+        "--skip-hevc-source", "true" if t.get("skip_hevc_source", True) else "false",
+        "--max-height", str(int(t.get("max_height", 0) or 0)),
+        "--overwrite", "true" if t.get("overwrite", False) else "false",
+        "--min-free-gb", str(float(t.get("min_free_gb", 5) or 5)),
+    ]
+    if video_filter_file:
+        args.extend(["--videos-file", str(video_filter_file)])
+    return args
+
+
 def run_pipeline_job(
     config,
     target_folders,
@@ -363,7 +490,7 @@ def run_pipeline_job(
     if not resume:
         if RESUME_FILE.exists():
             RESUME_FILE.unlink()
-    run_script(
+    return run_script(
         "run_pipeline.py",
         anchor_folder,
         pipeline_args(
@@ -406,9 +533,10 @@ def run_model_deps_install(stack):
 def start_pipeline_on_videos(config, folder, video_paths, *, resume=False):
     """Run the configured pipeline on an explicit list of video paths."""
     if not video_paths:
+        st.warning("No videos selected for the pipeline.")
         return False
     filter_file = write_pipeline_video_filter([str(p) for p in video_paths])
-    run_pipeline_job(
+    return run_pipeline_job(
         config,
         [folder],
         folder,
@@ -416,13 +544,19 @@ def start_pipeline_on_videos(config, folder, video_paths, *, resume=False):
         resume=resume,
         video_filter_file=filter_file,
     )
-    return True
 
 
 def run_script(script_name, folder, extra_args=None, folder_label=None):
     script_path = SCRIPT_DIR / script_name
     if not script_path.exists():
         st.error(f"Missing script: {script_path}")
+        return False
+
+    if not PYTHON_EXE.exists():
+        st.error(
+            f"Python environment not found at `{PYTHON_EXE}`. "
+            "Run **setup.bat** or **Tools/System → Install / Update AI Dependencies**."
+        )
         return False
 
     if block_if_job_running("start a new job"):
@@ -439,27 +573,42 @@ def run_script(script_name, folder, extra_args=None, folder_label=None):
     status_file = JOBS_DIR / f"{job_id}.json"
 
     cmd = [
-        str(APP_DIR / "venv" / "Scripts" / "python.exe"),
+        str(PYTHON_EXE),
         str(script_path),
         "--folder",
         folder,
         "--db",
         str(DB_FILE),
         "--status-file",
-        str(status_file)
+        str(status_file),
     ]
 
     if extra_args:
         cmd.extend(extra_args)
 
-    with open(log_file, "w", encoding="utf-8") as log:
+    try:
+        log = open(log_file, "w", encoding="utf-8")
+    except OSError as exc:
+        st.error(f"Could not create log file: {exc}")
+        return False
+
+    try:
         proc = subprocess.Popen(
             cmd,
             stdout=log,
             stderr=subprocess.STDOUT,
             cwd=str(APP_DIR),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.close()
+        st.error(f"Could not start {script_name}: {exc}")
+        return False
+    finally:
+        try:
+            log.close()
+        except Exception:
+            pass
 
     status = {
         "job_id": job_id,
@@ -478,7 +627,12 @@ def run_script(script_name, folder, extra_args=None, folder_label=None):
         "stop_requested": False,
     }
 
-    status_file.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    try:
+        status_file.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    except OSError as exc:
+        st.error(f"Job started but status file could not be written: {exc}")
+        return False
+
     st.success(f"Started: {script_name}")
     return True
 
@@ -506,9 +660,43 @@ def stop_job(job_file):
                 st.error(f"Could not stop process: {e}")
 
 
-@st.fragment(run_every=datetime.timedelta(seconds=1))
+def safe_get_videos(folder=None):
+    try:
+        return get_videos(folder=folder, db_file=str(DB_FILE))
+    except sqlite3.Error as exc:
+        st.error(f"Could not read the video catalog: {exc}")
+        return []
+
+
 def render_dashboard_live():
     job_files = active_job_files()
+    if not job_files:
+        latest = latest_job_files(running_only=False)
+        if latest:
+            latest_job = read_job(latest[0]) or {}
+            status = latest_job.get("status", "unknown")
+            if status == "failed":
+                st.error(
+                    f"Last job **{latest_job.get('script', 'job')}** failed: "
+                    f"{latest_job.get('current', 'See log below.')}"
+                )
+            elif status == "complete_with_failures":
+                st.warning(
+                    f"Last job **{latest_job.get('script', 'job')}** finished with per-video failures. "
+                    f"{latest_job.get('current', '')}"
+                )
+            elif status == "complete":
+                st.success(
+                    f"Last job **{latest_job.get('script', 'job')}** completed. "
+                    f"{latest_job.get('current', '')}"
+                )
+            elif status == "stopped":
+                st.info(
+                    f"Last job **{latest_job.get('script', 'job')}** was stopped. "
+                    f"{latest_job.get('current', '')}"
+                )
+            job_files = latest[:1]
+
     render_job_panel(
         job_files,
         read_job,
@@ -576,7 +764,7 @@ def render_dashboard_live():
 
 
 def render_logs_live():
-    """Log viewer — no @st.fragment here; fragments + selectbox inside tabs break tab layout."""
+    """Log viewer — plain widgets only; fragments/autorefresh inside tabs break tab layout."""
     logs = sorted(LOG_DIR.glob("*.log"), reverse=True)
 
     if not logs:
@@ -592,15 +780,10 @@ def render_logs_live():
             key="logs_tab_select",
         )
     with ctrl_col2:
-        auto_refresh = st.checkbox("Auto-refresh", value=False, key="logs_auto_refresh")
-
-    if auto_refresh:
-        try:
-            from streamlit_autorefresh import st_autorefresh
-
-            st_autorefresh(interval=2000, limit=None, key="logs_autorefresh_tick")
-        except ImportError:
-            st.caption("Install streamlit-autorefresh for auto-refresh.")
+        st.write("")
+        st.write("")
+        if st.button("Refresh log", key="logs_refresh_btn"):
+            st.rerun()
 
     if selected_log.exists():
         try:
@@ -619,19 +802,18 @@ def _render_job_banner(key_prefix):
     )
 
 
-def make_job_banner_fragment(key_prefix):
-    @st.fragment(run_every=datetime.timedelta(seconds=1))
+def make_job_banner(key_prefix):
     def banner():
         _render_job_banner(key_prefix)
     return banner
 
 
-job_banner_library = make_job_banner_fragment("bn_lib_")
-job_banner_jobs = make_job_banner_fragment("bn_jobs_")
-job_banner_search = make_job_banner_fragment("bn_search_")
-job_banner_tools = make_job_banner_fragment("bn_tools_")
-job_banner_logs = make_job_banner_fragment("bn_logs_")
-job_banner_help = make_job_banner_fragment("bn_help_")
+job_banner_library = make_job_banner("bn_lib_")
+job_banner_jobs = make_job_banner("bn_jobs_")
+job_banner_search = make_job_banner("bn_search_")
+job_banner_tools = make_job_banner("bn_tools_")
+job_banner_logs = make_job_banner("bn_logs_")
+job_banner_help = make_job_banner("bn_help_")
 
 INSTALL_JOB_SCRIPTS = {"install_dependencies.py", "install_model_deps.py"}
 
@@ -646,7 +828,6 @@ def dependency_job_files(running_only=False):
     return jobs
 
 
-@st.fragment(run_every=datetime.timedelta(seconds=1))
 def render_dependency_install_status():
     """Live install progress for Tools/System (mirrors Dashboard job panel)."""
     running_installs = dependency_job_files(running_only=True)
@@ -694,13 +875,47 @@ def render_dependency_install_status():
     )
 
 
-init_db(str(DB_FILE))
-cleanup_stale_resume_state()
-config = load_config()
-env_ready = environment_ready(APP_DIR)
+BOOTSTRAP_ERROR = None
+try:
+    init_db(str(DB_FILE))
+    cleanup_stale_resume_state()
+    config = load_config()
+    env_ready = environment_ready(APP_DIR)
+except Exception as exc:
+    BOOTSTRAP_ERROR = str(exc)
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    env_ready = False
 
 st.set_page_config(page_title="AI Video Indexer", layout="wide")
 st.title("AI Video Indexer")
+
+if CONFIG_LOAD_WARNING:
+    st.error(CONFIG_LOAD_WARNING)
+
+if BOOTSTRAP_ERROR:
+    st.error(
+        f"Startup error: {BOOTSTRAP_ERROR}. "
+        "Some features may be unavailable until the database and config are accessible."
+    )
+
+# One app-wide refresh while jobs run — avoids @st.fragment inside tabs (breaks tab layout).
+_needs_live_refresh = active_job_files() or dependency_job_files(running_only=True)
+if _needs_live_refresh or schedule_needs_background_poll(config):
+    try:
+        from streamlit_autorefresh import st_autorefresh
+
+        interval = 1000 if _needs_live_refresh else 60_000
+        st_autorefresh(interval=interval, limit=None, key="app_live_refresh")
+    except ImportError:
+        pass
+
+if config.get("schedule", {}).get("enabled"):
+    try:
+        _schedule_tick = tick_schedule(config)
+        if _schedule_tick.get("action") in {"started", "stopped"}:
+            st.toast(_schedule_tick.get("detail", "Schedule action completed."))
+    except Exception as exc:
+        st.warning(f"Schedule check failed: {exc}")
 
 tab_dashboard, tab_library, tab_jobs, tab_search, tab_tools, tab_logs, tab_help = st.tabs(
     ["Dashboard", "Library", "Run Jobs", "Search", "Tools/System", "Logs", "Help"]
@@ -723,7 +938,7 @@ with tab_library:
         st.write("")
         st.write("")
         browse_clicked = st.button(
-            "Browse...", key="browse_folder_btn", use_container_width=True
+            "Browse...", key="browse_folder_btn", width="stretch"
         )
 
     if browse_clicked:
@@ -767,6 +982,24 @@ with tab_library:
 
         st.code(config["selected_folder"])
 
+        disk_info = get_disk_space(selected)
+        if disk_info.get("available"):
+            st.caption(
+                f"**Volume space:** {format_disk_line(disk_info)} "
+                f"(queried at `{disk_info['path_queried']}`)"
+            )
+        else:
+            st.caption(f"**Volume space:** {format_disk_line(disk_info)}")
+
+        videos = safe_get_videos(folder=selected)
+
+        if videos:
+            catalog_bytes = sum(int(v.get("size_bytes") or 0) for v in videos)
+            st.caption(
+                f"**Catalog size (this folder):** {format_bytes(catalog_bytes)} "
+                f"across {len(videos)} video(s) in the database."
+            )
+
         remove_confirm = st.checkbox(
             "I understand this will remove this folder from the app library database",
             key="remove_folder_confirm"
@@ -795,8 +1028,6 @@ with tab_library:
 
                 st.success(f"Removed folder from library: {folder_to_remove}")
                 st.rerun()
-
-        videos = get_videos(folder=selected)
 
         st.subheader("Scanned Files")
         st.write(f"Videos in database for this folder: **{len(videos)}**")
@@ -862,11 +1093,11 @@ with tab_library:
                         disabled=not selected_names or not env_ready,
                     ):
                         paths = [file_options[name] for name in selected_names]
-                        start_pipeline_on_videos(config, selected, paths)
-                        st.success(
-                            f"Started pipeline for {len(paths)} file(s). "
-                            "Track progress on the Dashboard."
-                        )
+                        if start_pipeline_on_videos(config, selected, paths):
+                            st.success(
+                                f"Started pipeline for {len(paths)} file(s). "
+                                "Track progress on the Dashboard."
+                            )
 
             retry_col1, retry_col2 = st.columns([1, 3])
             with retry_col1:
@@ -881,19 +1112,19 @@ with tab_library:
                         saved_mode = config["processing"].get("skip_mode")
                         config["processing"]["skip_mode"] = "incomplete_only"
                         save_config(config)
-                        run_pipeline_job(
+                        if run_pipeline_job(
                             config,
                             [selected],
                             selected,
                             None,
                             video_filter_file=PIPELINE_VIDEO_FILTER,
-                        )
+                        ):
+                            st.success(
+                                f"Started pipeline for {len(incomplete_paths)} incomplete video(s). "
+                                "Track progress on the Dashboard."
+                            )
                         config["processing"]["skip_mode"] = saved_mode
                         save_config(config)
-                        st.success(
-                            f"Started pipeline for {len(incomplete_paths)} incomplete video(s). "
-                            "Track progress on the Dashboard."
-                        )
         else:
             st.info("No scanned files yet. Run Scan Library from the Run Jobs tab.")
     else:
@@ -1092,7 +1323,7 @@ with tab_jobs:
 
         st.caption(f"**{selected_count}** step(s) selected: {step_summary}")
 
-        folder_videos = get_videos(folder=selected_folder)
+        folder_videos = safe_get_videos(folder=selected_folder)
         file_pick_options = {v["filename"]: v["path"] for v in folder_videos}
         if file_pick_options:
             picked_names = st.multiselect(
@@ -1205,7 +1436,7 @@ with tab_jobs:
         saved_skip = config["processing"].get("skip_mode")
 
         with q_col1:
-            if st.button("Index missing only", use_container_width=True, disabled=not env_ready):
+            if st.button("Index missing only", width="stretch", disabled=not env_ready):
                 config["pipeline"] = {k: False for k in saved_pipeline}
                 config["pipeline"]["index"] = True
                 config["processing"]["skip_mode"] = "missing_only"
@@ -1217,7 +1448,7 @@ with tab_jobs:
                 save_config(config)
 
         with q_col2:
-            if st.button("Refresh stale metadata/index", use_container_width=True, disabled=not env_ready):
+            if st.button("Refresh stale metadata/index", width="stretch", disabled=not env_ready):
                 config["pipeline"] = {k: False for k in saved_pipeline}
                 config["pipeline"]["metadata"] = True
                 config["pipeline"]["index"] = True
@@ -1230,8 +1461,8 @@ with tab_jobs:
                 save_config(config)
 
         with q_col3:
-            if st.button("Retry incomplete videos", use_container_width=True, disabled=not env_ready):
-                folder_videos = get_videos(folder=selected_folder)
+            if st.button("Retry incomplete videos", width="stretch", disabled=not env_ready):
+                folder_videos = safe_get_videos(folder=selected_folder)
                 incomplete_paths = [
                     v["path"] for v in folder_videos if video_has_incomplete_steps(v)
                 ]
@@ -1251,6 +1482,204 @@ with tab_jobs:
                     save_config(config)
 
         st.caption("Live job progress is on the **Dashboard** tab (auto-refreshes every second).")
+
+        st.divider()
+        st.subheader("HEVC transcode (standalone)")
+        st.caption(
+            "Re-encode videos to H.265/HEVC for smaller file sizes. This is separate from the pipeline — "
+            "run it before indexing if you want to shrink your library first."
+        )
+
+        transcode_cfg = config.setdefault("transcode", DEFAULT_TRANSCODE.copy())
+        transcode_cfg["rate_control"] = st.radio(
+            "Rate control",
+            list(TRANSCODE_RATE_CONTROL_OPTIONS.keys()),
+            format_func=lambda key: TRANSCODE_RATE_CONTROL_OPTIONS[key],
+            index=list(TRANSCODE_RATE_CONTROL_OPTIONS.keys()).index(
+                transcode_cfg.get("rate_control", "crf")
+            ) if transcode_cfg.get("rate_control", "crf") in TRANSCODE_RATE_CONTROL_OPTIONS else 0,
+            horizontal=True,
+            key="transcode_rate_control",
+        )
+
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            if transcode_cfg["rate_control"] == "crf":
+                transcode_cfg["quality_preset"] = st.selectbox(
+                    "Quality preset",
+                    list(TRANSCODE_QUALITY_PRESETS.keys()),
+                    format_func=lambda key: TRANSCODE_QUALITY_PRESETS[key],
+                    index=list(TRANSCODE_QUALITY_PRESETS.keys()).index(
+                        transcode_cfg.get("quality_preset", "balanced")
+                    ) if transcode_cfg.get("quality_preset", "balanced") in TRANSCODE_QUALITY_PRESETS else 1,
+                    key="transcode_quality_preset",
+                )
+            elif transcode_cfg["rate_control"] == "bitrate":
+                transcode_cfg["target_bitrate_kbps"] = st.number_input(
+                    "Target video bitrate (kbps)",
+                    min_value=500,
+                    max_value=80000,
+                    value=int(transcode_cfg.get("target_bitrate_kbps", 8000) or 8000),
+                    step=500,
+                    help="Example: 8000 kbps ≈ 8 Mbps — good for 1080p HEVC.",
+                    key="transcode_target_bitrate",
+                )
+            else:
+                transcode_cfg["target_filesize_mb"] = st.number_input(
+                    "Target output size (MB per video)",
+                    min_value=50,
+                    max_value=50000,
+                    value=int(transcode_cfg.get("target_filesize_mb", 500) or 500),
+                    step=50,
+                    help="Encoder picks a video bitrate to hit this size based on each file's duration.",
+                    key="transcode_target_filesize",
+                )
+            transcode_cfg["encoder"] = st.selectbox(
+                "Video encoder",
+                ["auto", "nvenc", "x265"],
+                index=["auto", "nvenc", "x265"].index(transcode_cfg.get("encoder", "auto")),
+                format_func=lambda key: {
+                    "auto": "Auto (NVENC if available, else software x265)",
+                    "nvenc": "NVIDIA NVENC (fast, GPU)",
+                    "x265": "Software x265 (slower, often better compression)",
+                }[key],
+                key="transcode_encoder",
+            )
+            transcode_cfg["audio_mode"] = st.selectbox(
+                "Audio",
+                ["copy", "aac192", "aac128"],
+                index=["copy", "aac192", "aac128"].index(transcode_cfg.get("audio_mode", "copy")),
+                format_func=lambda key: {
+                    "copy": "Copy original audio (fastest)",
+                    "aac192": "Re-encode AAC 192 kbps",
+                    "aac128": "Re-encode AAC 128 kbps",
+                }[key],
+                key="transcode_audio_mode",
+            )
+        with tcol2:
+            transcode_cfg["output_mode"] = st.radio(
+                "Output mode",
+                ["suffix", "replace"],
+                index=0 if transcode_cfg.get("output_mode", "suffix") == "suffix" else 1,
+                format_func=lambda key: (
+                    "Keep original + write `.hevc` file alongside"
+                    if key == "suffix"
+                    else "Replace original (moves old file to `_OLD_FILES_REVIEW`)"
+                ),
+                key="transcode_output_mode",
+            )
+            transcode_cfg["output_extension"] = st.selectbox(
+                "Output container",
+                [".mp4", ".mkv"],
+                index=0 if transcode_cfg.get("output_extension", ".mp4") == ".mp4" else 1,
+                key="transcode_output_extension",
+            )
+            height_keys = list(TRANSCODE_MAX_HEIGHT_OPTIONS.keys())
+            transcode_cfg["max_height"] = st.selectbox(
+                "Max resolution",
+                height_keys,
+                format_func=lambda key: TRANSCODE_MAX_HEIGHT_OPTIONS[key],
+                index=height_keys.index(int(transcode_cfg.get("max_height", 0) or 0))
+                if int(transcode_cfg.get("max_height", 0) or 0) in height_keys else 0,
+                key="transcode_max_height",
+            )
+
+        with st.expander("Advanced transcode settings", expanded=False):
+            if transcode_cfg["rate_control"] == "crf":
+                transcode_cfg["crf"] = st.slider(
+                    "Custom CRF (0 = use preset)",
+                    min_value=0,
+                    max_value=36,
+                    value=int(transcode_cfg.get("crf", 0) or 0),
+                    help="Lower = better quality and larger files. HEVC sweet spot is usually 22–28.",
+                    key="transcode_crf",
+                )
+            transcode_cfg["x265_preset"] = st.selectbox(
+                "x265 speed preset (software encoder only)",
+                ["ultrafast", "fast", "medium", "slow", "veryslow"],
+                index=["ultrafast", "fast", "medium", "slow", "veryslow"].index(
+                    transcode_cfg.get("x265_preset", "medium")
+                ) if transcode_cfg.get("x265_preset", "medium") in {
+                    "ultrafast", "fast", "medium", "slow", "veryslow"
+                } else 2,
+                key="transcode_x265_preset",
+            )
+            transcode_cfg["skip_hevc_source"] = st.checkbox(
+                "Skip files already HEVC/H.265",
+                value=bool(transcode_cfg.get("skip_hevc_source", True)),
+                key="transcode_skip_hevc",
+            )
+            transcode_cfg["overwrite"] = st.checkbox(
+                "Overwrite existing transcode outputs",
+                value=bool(transcode_cfg.get("overwrite", False)),
+                key="transcode_overwrite",
+            )
+            transcode_cfg["min_free_gb"] = st.number_input(
+                "Minimum free space headroom (GB)",
+                min_value=0.0,
+                max_value=500.0,
+                value=float(transcode_cfg.get("min_free_gb", 5) or 5),
+                step=1.0,
+                help="Job refuses to start if the volume has less than this much space beyond the encode estimate.",
+                key="transcode_min_free_gb",
+            )
+
+        config["transcode"] = transcode_cfg
+        save_config(config)
+
+        transcode_picked = []
+        transcode_candidate_paths = []
+        space_preview = {}
+        if file_pick_options:
+            transcode_picked = st.multiselect(
+                "Transcode specific file(s) only (optional)",
+                options=sorted(file_pick_options.keys()),
+                key="transcode_file_picker",
+            )
+            if transcode_picked:
+                transcode_candidate_paths = [
+                    file_pick_options[name] for name in transcode_picked
+                ]
+            else:
+                transcode_candidate_paths = list(file_pick_options.values())
+        elif folder_videos:
+            transcode_candidate_paths = [v["path"] for v in folder_videos]
+
+        if transcode_candidate_paths:
+            space_preview = transcode_space_check(
+                selected_folder,
+                transcode_candidate_paths,
+                output_mode=transcode_cfg.get("output_mode", "suffix"),
+                min_free_gb=float(transcode_cfg.get("min_free_gb", 5) or 5),
+            )
+            if space_preview["ok"]:
+                st.info(space_preview["message"])
+            else:
+                st.warning(space_preview["message"])
+            if space_preview["disk"].get("available"):
+                st.caption(f"Volume: {format_disk_line(space_preview['disk'])}")
+
+        transcode_block_reason = None
+        if transcode_candidate_paths and space_preview.get("disk", {}).get("available") and not space_preview.get("ok"):
+            transcode_block_reason = "Not enough free disk space for the selected transcode."
+
+        if st.button(
+            "Run HEVC Transcode",
+            disabled=not env_ready or bool(transcode_block_reason),
+            key="run_hevc_transcode_btn",
+        ):
+            extra = transcode_args(config)
+            if transcode_picked:
+                filter_file = write_pipeline_video_filter(
+                    [file_pick_options[name] for name in transcode_picked]
+                )
+                extra = transcode_args(config, video_filter_file=filter_file)
+            run_script("transcode_hevc.py", selected_folder, extra_args=extra)
+
+        st.caption(
+            "Logs: `logs/transcode_hevc_converted_*.csv` and `transcode_hevc_failed_*.csv`. "
+            "After **replace** mode, run **Scan Library** and re-index affected videos."
+        )
 
         if st.button("Clear Job History", key="jobs_clear_history"):
             for job in JOBS_DIR.glob("*.json"):
@@ -1473,7 +1902,7 @@ with tab_search:
                 top_col1, top_col2, top_col3, top_col4 = st.columns([1, 4, 2, 1])
                 with top_col1:
                     if thumb_path:
-                        st.image(str(thumb_path), use_container_width=True)
+                        st.image(str(thumb_path), width="stretch")
                 with top_col2:
                     safe_name = html.escape(result["filename"])
                     st.markdown(
@@ -1491,7 +1920,7 @@ with tab_search:
                         unsafe_allow_html=True,
                     )
                 with top_col4:
-                    if st.button("Play", key=f"play_{i}", use_container_width=True):
+                    if st.button("Play", key=f"play_{i}", width="stretch"):
                         ok, message = open_video_at_timestamp(
                             result["video_path"],
                             result["start"],
@@ -1533,6 +1962,7 @@ with tab_tools:
         st.rerun()
 
     st.subheader("Catalog maintenance")
+    render_pipeline_failures_panel()
     maint_col1, maint_col2 = st.columns(2)
     with maint_col1:
         if st.button("Prune ghost catalog entries", disabled=bool(running_job_summary())):
@@ -1586,8 +2016,12 @@ with tab_tools:
     index_stats = get_search_index_stats(str(DB_FILE))
     if index_stats.get("qdrant_locked"):
         st.warning(
-            "Search index is busy (indexing job running). "
-            "Segment counts and search will work again when the job finishes."
+            "Search index is briefly locked while a video is being indexed. "
+            "Search usually works between files — retry in a few seconds."
+        )
+    elif index_stats.get("qdrant_indexing_active"):
+        st.caption(
+            "Indexing is running. Search uses already-indexed segments and may pause briefly per file."
         )
     st.write(
         f"Searchable segments: **{index_stats['segment_count']}** · "
@@ -1622,6 +2056,116 @@ with tab_tools:
             "Clears the Qdrant vector database and resets indexed flags in the catalog. "
             "Run **Index search DB** afterward to rebuild search from your metadata files."
         )
+
+    st.subheader("Overnight / scheduled runs")
+    st.caption(
+        "Run the pipeline overnight while you sleep, stop at a set time, and resume the next "
+        "scheduled night. Manual jobs on Run Jobs are never auto-stopped."
+    )
+
+    schedule_cfg = config.setdefault("schedule", DEFAULT_SCHEDULE.copy())
+    sched_status = schedule_status(config)
+
+    status_bits = []
+    if sched_status["enabled"]:
+        status_bits.append("enabled")
+        status_bits.append("in run window" if sched_status["in_window"] else "outside run window")
+        status_bits.append("active day" if sched_status["active_day"] else "inactive day")
+        if sched_status["running_scheduled_pipeline"]:
+            status_bits.append("scheduled pipeline running")
+        elif sched_status["can_resume"]:
+            status_bits.append("resume available")
+    if status_bits:
+        st.info("Schedule: " + " · ".join(status_bits))
+
+    day_defaults = schedule_cfg.get("days_of_week", DEFAULT_SCHEDULE["days_of_week"])
+    start_default = datetime.datetime.strptime(
+        schedule_cfg.get("start_time", "22:00"), "%H:%M"
+    ).time()
+    stop_default = datetime.datetime.strptime(
+        schedule_cfg.get("stop_time", "06:00"), "%H:%M"
+    ).time()
+
+    with st.form("schedule_settings_form", clear_on_submit=False):
+        schedule_enabled = st.checkbox(
+            "Enable overnight schedule",
+            value=bool(schedule_cfg.get("enabled", False)),
+        )
+        day_cols = st.columns(7)
+        selected_days = []
+        for col, (day_key, day_label) in zip(day_cols, WEEKDAY_LABELS):
+            with col:
+                if st.checkbox(
+                    day_label[:3],
+                    value=day_key in day_defaults,
+                    key=f"sched_day_{day_key}",
+                ):
+                    selected_days.append(day_key)
+        time_col1, time_col2 = st.columns(2)
+        with time_col1:
+            start_time = st.time_input("Start time", value=start_default)
+        with time_col2:
+            stop_time = st.time_input("Stop time", value=stop_default)
+        scope = st.radio(
+            "Folders to process",
+            options=["all_folders", "selected_folder"],
+            format_func=lambda key: "All library folders" if key == "all_folders" else "Selected folder only",
+            index=0 if schedule_cfg.get("scope", "all_folders") == "all_folders" else 1,
+            horizontal=True,
+        )
+        auto_resume = st.checkbox(
+            "Auto-resume stopped runs",
+            value=bool(schedule_cfg.get("auto_resume", True)),
+            help="When a run was stopped at the stop time, continue from the saved resume point next window.",
+        )
+        save_schedule = st.form_submit_button("Save schedule settings")
+
+    if save_schedule:
+        config["schedule"] = {
+            "enabled": schedule_enabled,
+            "days_of_week": selected_days,
+            "start_time": start_time.strftime("%H:%M"),
+            "stop_time": stop_time.strftime("%H:%M"),
+            "scope": scope,
+            "auto_resume": auto_resume,
+        }
+        save_config(config)
+        st.success("Schedule settings saved.")
+        st.rerun()
+
+    sched_action_col1, sched_action_col2, sched_action_col3 = st.columns(3)
+    with sched_action_col1:
+        if st.button("Run schedule check now"):
+            result = tick_schedule(config)
+            if result.get("action") == "none":
+                st.info(result.get("detail") or "No schedule action needed right now.")
+            elif result.get("action") == "started":
+                st.success(result.get("detail", "Started scheduled pipeline."))
+            elif result.get("action") == "stopped":
+                st.warning(result.get("detail", "Stopped scheduled pipeline."))
+            else:
+                st.info(result.get("detail", ""))
+            st.rerun()
+    with sched_action_col2:
+        if st.button("Register Windows task"):
+            ok, message = register_windows_scheduled_task()
+            if ok:
+                st.success(message)
+            else:
+                st.error(message)
+    with sched_action_col3:
+        if st.button("Remove Windows task"):
+            ok, message = remove_windows_scheduled_task()
+            if ok:
+                st.success(message)
+            else:
+                st.error(message)
+
+    st.caption(
+        "For overnight runs while the app is closed, run **register_schedule_task.bat** "
+        "(or **Register Windows task** above) so Windows checks every 5 minutes. "
+        "Keep the PC awake; logs go to `logs/schedule.log`."
+    )
 
     st.subheader("Discord Notifications")
 
@@ -1732,27 +2276,38 @@ with tab_tools:
     system_check_file = DATA_DIR / "system_check.json"
 
     if system_check_file.exists():
-        check = json.loads(system_check_file.read_text(encoding="utf-8"))
+        try:
+            check = json.loads(system_check_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            st.warning(
+                f"System check file is unreadable ({exc}). "
+                "Click **Refresh System Check** to regenerate it."
+            )
+            check = None
+        if check:
+            st.write("### System Information")
+            st.dataframe(
+                pd.DataFrame(check.get("system", [])),
+                width="stretch",
+                hide_index=True,
+            )
 
-        st.write("### System Information")
-        st.dataframe(
-            pd.DataFrame(check.get("system", [])),
-            width="stretch",
-            hide_index=True
-        )
-
-        st.write("### Dependency Status")
-        st.dataframe(
-            pd.DataFrame(check.get("dependencies", [])),
-            width="stretch",
-            hide_index=True
-        )
+            st.write("### Dependency Status")
+            st.dataframe(
+                pd.DataFrame(check.get("dependencies", [])),
+                width="stretch",
+                hide_index=True,
+            )
     else:
         st.info("Click Refresh System Check to generate system/dependency information.")
 
     st.subheader("Database Summary")
 
-    db_stats = get_library_stats(str(DB_FILE))
+    try:
+        db_stats = get_library_stats(str(DB_FILE))
+    except sqlite3.Error as exc:
+        st.error(f"Could not read database summary: {exc}")
+        db_stats = {"total": 0, "transcribed": 0, "vision": 0, "indexed": 0}
     st.write(f"Total scanned videos: **{db_stats['total']}**")
     st.write(f"With transcripts: **{db_stats['transcribed']}**")
     st.write(f"With vision: **{db_stats['vision']}**")
@@ -1766,19 +2321,15 @@ with tab_logs:
 
     with col_clear1:
         if st.button("Clear All Logs"):
+            cleared = 0
             for log in LOG_DIR.glob("*.log"):
                 try:
                     log.unlink()
+                    cleared += 1
                 except Exception:
                     pass
 
-            for job in JOBS_DIR.glob("*.json"):
-                try:
-                    job.unlink()
-                except Exception:
-                    pass
-                
-            st.success("Logs cleared.")
+            st.success(f"Cleared {cleared} log file(s). Job history on Run Jobs was not changed.")
             st.rerun()
 
     render_logs_live()

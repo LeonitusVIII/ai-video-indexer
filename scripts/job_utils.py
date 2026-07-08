@@ -1,6 +1,8 @@
+import datetime
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 VIDEO_EXTENSIONS = {
@@ -46,6 +48,41 @@ def write_status(status_file, data):
     if not status_file:
         return
     Path(status_file).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def fail_job_status(status_file, exc, *, prefix=""):
+    """Mark a job status file failed — used when a script crashes unexpectedly."""
+    status = read_status(status_file) if status_file else {}
+    message = str(exc).strip() or exc.__class__.__name__
+    if prefix:
+        message = f"{prefix}: {message}"
+    status.update({
+        "status": "failed",
+        "current": message[:500],
+        "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+    write_status(status_file, status)
+
+
+def status_file_from_argv(argv=None):
+    argv = argv or sys.argv
+    for index, arg in enumerate(argv):
+        if arg == "--status-file" and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def run_script_main(main_fn, status_file=None):
+    """Top-level guard so unexpected exceptions update the job JSON before exit."""
+    try:
+        main_fn()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if status_file:
+            fail_job_status(status_file, exc)
+        print(f"FAILED: {exc}", flush=True)
+        raise SystemExit(1) from exc
 
 
 def set_item_progress(status, status_file, item_label, item_processed, item_total):

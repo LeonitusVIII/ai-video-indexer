@@ -317,7 +317,7 @@ def send_discord(event, folder_label, details, log_file):
 def finalize_status(status_file, status, event, completed_units, total_units, message, resume_state=None):
     status.update({
         "status": event,
-        "percent": 100 if event == "complete" else int((completed_units / total_units) * 100),
+        "percent": 100 if event in {"complete", "complete_with_failures"} else int((completed_units / total_units) * 100),
         "processed": completed_units,
         "total": total_units,
         "current": message,
@@ -329,7 +329,7 @@ def finalize_status(status_file, status, event, completed_units, total_units, me
         resume_state["status"] = event
         resume_state["folder_index"] = resume_state.get("folder_index", 0)
         resume_state["step_index"] = resume_state.get("step_index", 0)
-        if event == "complete":
+        if event in {"complete", "complete_with_failures"}:
             clear_resume_state()
         else:
             save_resume_state(resume_state)
@@ -504,7 +504,7 @@ def main():
     finalize_status(
         status_file,
         read_status(status_file),
-        "complete",
+        event,
         completed_units,
         total_units,
         message,
@@ -516,4 +516,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import fail_job_status, status_file_from_argv
+
+    status_path = status_file_from_argv()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if status_path:
+            fail_job_status(status_path, exc)
+        print(f"FAILED: {exc}", flush=True)
+        raise SystemExit(1) from exc

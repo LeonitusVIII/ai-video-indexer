@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import gc
 import hashlib
 import json
 import sys
@@ -17,15 +18,16 @@ from job_utils import (
     overwrite_from_args,
     read_status,
     should_stop,
-    update_video_flag,
     write_status,
 )
 from ml_bootstrap import prepare_ml_environment
+from catalog_db import CatalogWriter, update_video_flag as catalog_update_flag
 from pipeline_utils import (
     add_pipeline_control_args,
     clear_step_failure,
     filter_videos_for_step,
     get_video_row,
+    load_video_rows_map,
     load_video_allowlist,
     record_step_failure,
     skip_mode_from_args,
@@ -74,6 +76,16 @@ def get_qdrant_client(vector_size):
         print(f"Created Qdrant collection: {COLLECTION_NAME}", flush=True)
 
     return client
+
+
+def close_qdrant_client(client):
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def delete_video_points(client, video_path):
@@ -181,6 +193,7 @@ def main():
         allowlist,
     )
     total = len(videos)
+    row_cache = load_video_rows_map(args.db, videos)
 
     status.update({
         "total": total,
@@ -189,14 +202,15 @@ def main():
     write_status(status_file, status)
     print(f"Found {total} video files.", flush=True)
 
-    client = None
+    indexed_count = 0
+    vector_size = None
+
     try:
         embedder = load_embedder()
         if hasattr(embedder, "get_embedding_dimension"):
             vector_size = embedder.get_embedding_dimension()
         else:
             vector_size = embedder.get_sentence_embedding_dimension()
-        client = get_qdrant_client(vector_size)
     except Exception as e:
         status.update({
             "status": "failed",
@@ -207,9 +221,7 @@ def main():
         print(f"FAILED: {e}", flush=True)
         sys.exit(1)
 
-    indexed_count = 0
-
-    try:
+    with CatalogWriter(args.db) as writer:
         for i, video in enumerate(videos, start=1):
             if should_stop(status_file):
                 status.update({
@@ -234,12 +246,14 @@ def main():
             if not metadata_file.exists():
                 print(f"Skipping (no metadata): {video}", flush=True)
             else:
-                row = get_video_row(args.db, video)
+                row = get_video_row(args.db, video, row_cache=row_cache)
                 if not overwrite and step_status(row, "index") == "complete":
                     print(f"Skipping (already indexed): {video}", flush=True)
                 else:
                     print(f"\nIndexing: {video}", flush=True)
+                    client = None
                     try:
+                        client = get_qdrant_client(vector_size)
                         metadata = json.loads(
                             metadata_file.read_text(encoding="utf-8")
                         )
@@ -247,7 +261,7 @@ def main():
                             client, embedder, metadata, overwrite=overwrite
                         )
                         if chunk_count:
-                            update_video_flag(args.db, video, "indexed_in_qdrant")
+                            catalog_update_flag(writer, video, "indexed_in_qdrant")
                             clear_step_failure(video, "index")
                             indexed_count += chunk_count
                             print(f"Indexed {chunk_count} segments", flush=True)
@@ -255,6 +269,8 @@ def main():
                         record_step_failure(video, "index", str(e))
                         print(f"FAILED: {video}", flush=True)
                         print(str(e), flush=True)
+                    finally:
+                        close_qdrant_client(client)
 
             percent = int((i / total) * 100) if total else 100
             status.update({
@@ -265,21 +281,17 @@ def main():
             })
             write_status(status_file, status)
 
-        status.update({
-            "status": "complete",
-            "percent": 100,
-            "current": f"Qdrant indexing complete. Indexed {indexed_count} segments.",
-            "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        })
-        write_status(status_file, status)
-        print(f"Qdrant indexing complete. Indexed {indexed_count} segments.", flush=True)
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+    status.update({
+        "status": "complete",
+        "percent": 100,
+        "current": f"Qdrant indexing complete. Indexed {indexed_count} segments.",
+        "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+    write_status(status_file, status)
+    print(f"Qdrant indexing complete. Indexed {indexed_count} segments.", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import run_script_main, status_file_from_argv
+
+    run_script_main(main, status_file_from_argv())

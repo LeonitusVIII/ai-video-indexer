@@ -2,6 +2,31 @@
 
 All notable changes to AI Video Indexer are documented here.
 
+## [0.2.2] — 2026-07-08
+
+### Added
+
+- **Overnight / scheduled runs** — Tools/System schedule with weekdays, start/stop times, auto-resume, and Windows Task Scheduler integration (`register_schedule_task.bat`). Only scheduler-started jobs are auto-stopped; manual Run Jobs are unaffected.
+- **Search while indexing** — Qdrant lock is released between indexed videos; search retries briefly instead of blocking for the whole job.
+- **Batch SQLite in pipeline** — catalog writes reuse one connection and commit in batches; scan upserts merge sidecar sync into a single transaction; pipeline steps preload row caches to cut per-video reads.
+- **HEVC transcode (standalone)** — Run Jobs section to re-encode to H.265 with quality presets, NVENC/x265 encoder choice, audio options, resolution cap, suffix or replace output modes.
+- **Disk space visibility** — Library tab shows volume free/total (local and many UNC shares); HEVC transcode checks space before starting.
+- **HEVC target bitrate / file size** — alternative to CRF for predictable output size.
+- **Pipeline failures panel** — Tools/System lists per-video errors from pipeline, normalize, and transcode jobs with a clear-all option.
+
+### Changed
+
+- **Tab layout** — single app-level auto-refresh when jobs or schedule are active; removed tab fragments that could collapse the UI.
+- **Streamlit layout API** — `use_container_width` updated to `width="stretch"` where supported.
+
+### Fixed
+
+- **Logs → Clear All Logs** — clears only `logs/*.log` files; job history on Run Jobs is preserved.
+- **Error handling** — hardened config load, job crash handlers, clearer Dashboard/job messages, safer search and job startup paths.
+- **False “started” toasts** — pipeline/transcode only reports success when the job process actually launches.
+- **`complete_with_failures` status** — partial pipeline success is now visible on Dashboard and job history.
+- **Normalize & transcode failures** — recorded in `pipeline_failures.json` and shown in the failures panel (not only CSV logs).
+
 ## [0.2.1] — 2026-07-07
 
 ### Added

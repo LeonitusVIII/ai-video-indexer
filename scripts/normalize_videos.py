@@ -13,6 +13,8 @@ from job_utils import read_status, should_stop, write_status
 from pipeline_utils import (
     add_pipeline_control_args,
     load_video_allowlist,
+    record_step_failure,
+    clear_step_failure,
     should_process_video,
     skip_mode_from_args,
     step_overwrite_from_args,
@@ -243,6 +245,7 @@ def reconcile_stale_records(db, folder):
     paths = [row[0] for row in cur.fetchall()]
     con.close()
 
+    stale_delete_paths = []
     for path_str in paths:
         path = Path(path_str)
 
@@ -252,17 +255,20 @@ def reconcile_stale_records(db, folder):
             if mkv.exists():
                 migrate_video_record(db, path, mkv)
             else:
-                con = sqlite3.connect(db)
-                cur = con.cursor()
-                cur.execute("DELETE FROM videos WHERE path = ?", (path_str,))
-                con.commit()
-                con.close()
+                stale_delete_paths.append(path_str)
             continue
 
         if path.suffix.lower() in OLD_EXTENSIONS:
             mkv = path.with_suffix(".mkv")
             if mkv.exists():
                 migrate_video_record(db, path, mkv)
+
+    if stale_delete_paths:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from catalog_db import CatalogWriter, delete_video_paths
+
+        with CatalogWriter(db) as writer:
+            delete_video_paths(writer, stale_delete_paths)
 
 
 def find_candidates(folder):
@@ -381,6 +387,7 @@ def main():
 
             if not ok:
                 print(f"FAILED CONVERT: {src}", flush=True)
+                record_step_failure(src, "normalize", error or "convert failed")
                 failed_rows.append({
                     "source": str(src),
                     "target": str(dst),
@@ -388,6 +395,7 @@ def main():
                 })
             elif not ffprobe_ok(dst):
                 print(f"FAILED VERIFY: {dst}", flush=True)
+                record_step_failure(src, "normalize", "ffprobe verification failed")
                 failed_rows.append({
                     "source": str(src),
                     "target": str(dst),
@@ -396,6 +404,7 @@ def main():
             else:
                 copied_sidecars = copy_sidecars(src, dst)
                 delete_original_and_old_sidecars(src)
+                clear_step_failure(src, "normalize")
 
                 try:
                     migrate_video_record(args.db, src, dst)
@@ -458,4 +467,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from job_utils import run_script_main, status_file_from_argv
+
+    run_script_main(main, status_file_from_argv())

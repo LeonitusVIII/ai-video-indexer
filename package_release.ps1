@@ -17,6 +17,7 @@ $IncludeFiles = @(
     "app_db.py",
     "pipeline_estimate.py",
     "search_engine.py",
+    "disk_space.py",
     "notifications.py",
     "README.md",
     "CHANGELOG.md",
@@ -25,6 +26,7 @@ $IncludeFiles = @(
     "config.example.json",
     "setup.bat",
     "start.bat",
+    "register_schedule_task.bat",
     ".gitignore"
 )
 

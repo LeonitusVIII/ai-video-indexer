@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
@@ -82,6 +83,30 @@ def _open_qdrant_client():
         raise
 
 
+def _open_qdrant_client_with_retry(max_attempts=12, delay_seconds=0.3):
+    """Open local Qdrant with short retries so search can run between indexing videos."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return _open_qdrant_client()
+        except QdrantLockError as exc:
+            last_exc = exc
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(delay_seconds)
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+def _try_open_qdrant_for_read():
+    """Best-effort read client; returns (client, locked) where locked means indexing holds the DB."""
+    try:
+        return _open_qdrant_client_with_retry(), False
+    except QdrantLockError:
+        return None, True
+
+
 def _close_qdrant_client(client):
     if client is None:
         return
@@ -138,12 +163,10 @@ def get_search_index_stats(db_file=None):
         con.close()
 
     if _qdrant_likely_busy():
-        stats["qdrant_locked"] = True
-        return stats
+        stats["qdrant_indexing_active"] = True
 
-    try:
-        client = _open_qdrant_client()
-    except QdrantLockError:
+    client, locked = _try_open_qdrant_for_read()
+    if locked:
         stats["qdrant_locked"] = True
         return stats
 
@@ -543,20 +566,12 @@ def search_videos(
     log["index_stats"] = index_stats
     _log_step(log, "index_stats_loaded", **index_stats)
 
-    if _qdrant_likely_busy():
-        msg = (
-            "Search is temporarily unavailable while an indexing job is running. "
-            "Try again when the job finishes."
-        )
-        _log_step(log, "blocked", reason="qdrant_busy_job")
-        return _finish_search(log, [], msg)
-
     try:
-        client = _open_qdrant_client()
+        client = _open_qdrant_client_with_retry()
     except QdrantLockError as exc:
         msg = (
-            "Search is temporarily unavailable while an indexing job is running. "
-            "Try again when the job finishes."
+            "Search is briefly busy while a video is being indexed. "
+            "Wait a few seconds and try again — search works between indexed files."
         )
         _log_step(log, "blocked", reason="qdrant_lock_error", detail=str(exc))
         return _finish_search(log, [], msg)
@@ -744,5 +759,8 @@ def search_videos(
 
         _log_step(log, "success", returned=min(len(results), limit))
         return _finish_search(log, results[:limit], None)
+    except Exception as exc:
+        _log_step(log, "error", detail=str(exc))
+        return _finish_search(log, [], f"Search failed: {exc}")
     finally:
         _close_qdrant_client(client)
